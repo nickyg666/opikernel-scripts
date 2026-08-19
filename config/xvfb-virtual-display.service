@@ -1,0 +1,12 @@
+[Unit]
+Description=Virtual 720p display (dummy) for headless GPU rendering
+Before=display-manager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/Xvfb :1 -screen 0 1280x720x24 -nolisten tcp
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

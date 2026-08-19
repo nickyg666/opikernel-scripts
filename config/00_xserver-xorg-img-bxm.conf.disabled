@@ -1,0 +1,2 @@
+# Prioritize loading the so provided by xserver-xorg-img-bxm
+/usr/local/lib

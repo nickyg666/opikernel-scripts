@@ -1,0 +1,13 @@
+[Unit]
+Description=Mirror primary display onto ILI9486 SPI panel
+After=xvfb-virtual-display.service display-manager.service
+Wants=xvfb-virtual-display.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/spi-mirror-select.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

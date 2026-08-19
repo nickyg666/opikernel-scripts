@@ -1,0 +1,246 @@
+# Workspace Rules
+
+> **Parallel track**: a mainline 6.18.19+ hybrid kernel also boots this board and is now GPU+WiFi capable — see `docs/MAINLINE-KERNEL.md` for that bring-up (separate from this vendor-stack guide).
+
+## Display / KMS Policy (CRITICAL — read before any display work)
+
+This board (Orange Pi Zero 3W, sun60iw2) has three possible displays:
+
+- **HDMI-A-1** (card0, sunxi-drm + sunxi-hdmi)
+- **USB-C** (connected via `twi@7084000/husb311@22/connector` — a second DP/display path)
+- **ILI9486 SPI panel** (card1, custom `ili9486` + `drm_mipi_dbi` modules, DRM minor 1, `fb0: ili9486drmfb`)
+
+**Mandatory initialization order:**
+
+1. **Always initialize HDMI and USB-C displays FIRST.** They are the primary displays
+   and must be brought up before the SPI panel. Never add `no-sunxi-drm` or anything that
+   tears down `sunxi-drm`/`sunxi-hdmi`, and never suppress the HDMI connector.
+2. **Duplicate/mirror the first-initialized display onto the SPI panel.** The ili9486
+   SPI display must always show a copy of whichever external display initialized first
+   (HDMI or USB-C). Do not drive the SPI panel as an independent/orphan screen.
+3. Never edit `/boot/orangepiEnv.txt` `overlays=`/`extraargs=` to disable sunxi-drm or
+   force HDMI off. If you think you need to, you are wrong — re-read this file.
+
+### Boot config invariants (must remain true)
+
+- `overlays=ili9486` — the ili9486.dtbo must exist at
+  `/boot/dtb-6.6.98-sun60iw2/allwinner/overlay/sun60i-a733-ili9486.dtbo` AND at
+  `/boot/dtb/allwinner/overlay/sun60i-a733-ili9486.dtbo` (the ACTIVE path u-boot
+  boot.scr uses — the dtb-6.6.98 one is the kernel-package copy; changes to the
+  active overlay MUST go to /boot/dtb/allwinner/overlay/).
+- `extraargs=fbcon=map:1` (NO `video=HDMI-A-1:d` — HDMI must be allowed to bind).
+- `/etc/modules-load.d/ili9486.conf` must list `drm_mipi_dbi`, `ili9486`, `ads7846`
+  (boot watchdog deletes it after 3 failed boots — restore it if missing).
+- If a boot watchdog rollback marker exists (`/var/lib/ili9486-boot-count.rolled-back`),
+  re-verify these invariants before assuming the machine is healthy.
+- `scale = <1>` in the dtbo (native 480x320 panel; the DRM mode IS 480x320).
+  `spi-max-frequency = <0x1e84800>` (32MHz — 40MHz glitched, do NOT retry).
+
+### Failure history
+
+1. **no-sunxi-drm overlay (2026-08-05)** — a session added `no-sunxi-drm` to `overlays=`
+   to stop the mutter Wayland segfault. This VIOLATED the HDMI-first policy and would
+   have permanently broken HDMI/USB-C. Reverted; the correct fix was moving the
+   compositor off the SPI panel entirely (see Wayland below). NEVER disable sunxi-drm.
+2. **40MHz SPI overclock** — glitched the panel; reverted to 32MHz. Hardware limit.
+3. **Wrong overlay path** — dtbo changes went to /boot/dtb-6.6.98-sun60iw2/ which is
+   NOT what u-boot loads. The ACTIVE dir is /boot/dtb/allwinner/overlay/.
+
+## Current Architecture (2026-08-06)
+
+The display stack is "virtual display + mirror":
+
+- **X session (gdm) runs on HDMI only** (card0) — the SPI panel is NOT an X screen.
+  Config: `/etc/X11/xorg.conf.d/10-lcd-modesetting.conf` (kmsdev card0, HDMI-1 at
+  1280x720 via preferred modeline, `AccelMethod "none"`).
+- **Xvfb :1** (`xvfb-virtual-display.service`) — virtual 1280x720 display, always
+  present, used for headless GPU rendering when no HDMI is connected.
+- **spi-mirror** (`spi-mirror.service` → `/usr/local/bin/spi-mirror-select.sh` →
+  `/home/orangepi/spi-mirror`) — grabs the real X display root window (NOT :1 when
+  HDMI is up), box-filters to 480x320, writes **XRGB8888 32bpp** (NOT RGB565 — that
+  bug caused doubled images) into /dev/fb-lcd. Kernel shadow-diff pushes changed
+  16x16 blocks over SPI. ~8fps.
+- **Minecraft**: `minecraft/game-run.sh` auto-detects the live display (:0/:2/:1),
+  runs PrismLauncher with `MESA_LOADER_DRIVER_OVERRIDE=zink MESA_GL_VERSION_OVERRIDE=4.5
+  MESA_VK_WSI_DEBUG=sw ALSOFT_DRIVERS=null`. zink renders on the PowerVR GPU
+  (GL→Vulkan); `MESA_VK_WSI_DEBUG=sw` forces Mesa's software-present fallback
+  (XShmPutImage) because this X stack has NO DRI3 (glamor hangs on both card0 and
+  card1 — hardware/driver lock, do not retry).
+  - **Instances**: 26.1.2 (NeoForge, modded) and 26.2 (vanilla). 26.2 has a native
+    Vulkan backend (`com/mojang/blaze3d/vulkan/*`, `PreferredGraphicsApi` enum:
+    DEFAULT/OPENGL/VULKAN) selected via `options.txt` `preferredGraphicsBackend`.
+  - **DO NOT select VULKAN on 26.2** — the native IMG ICD (`libVK_IMG.so`) cannot
+    present on this stack: no DRI3 + 256x256 hard WSI cap (see docs/GPU.md), and
+    `MESA_VK_WSI_DEBUG=sw` on the native path segfaults during swapchain creation
+    (verified with vkpresent_test). Force `preferredGraphicsBackend:"opengl"` so it
+    uses the proven zink path. Same for 26.1.2.
+  - **Both instances tuned for the weak PowerVR**: windowed 854x480, maxFps 45,
+    renderDistance 8, guiScale 1 (was 1920x1080 fullscreen / maxFps 120 → slideshow).
+  - **26.2 (vanilla) BOOTS OFFLINE on the GPU** — confirmed 2026-08-06: java runs,
+    `Backend library: LWJGL 3.4.1+2`, `Using graphics backend OpenGL, drivers 4.5
+    (Core Profile) Mesa 23.2.1`, `Using graphics device: zink Vulkan 1.3 (PowerVR
+    B-Series BXM-4-64 MC1 (IMAGINATION_PROPRIETARY))`, window "Minecraft 26.2"
+    854x480 on :0, SPI mirror active, stable (vanilla has no NeoForge auth dep).
+    Launch with `--offline orangepi`:
+    `./PrismLauncher --launch 26.2 --offline orangepi` (env: MESA_LOADER_DRIVER_OVERRIDE=zink
+    MESA_GL_VERSION_OVERRIDE=4.5 MESA_VK_WSI_DEBUG=sw EGL_PLATFORM=x11 ALSOFT_DRIVERS=null).
+  - 26.1.2 (NeoForge) requires a real MSA login (offline mode aborts with authlib
+    401 during boot) — needs user to re-login to Mojang in PrismLauncher GUI.
+  - Launch a specific instance: `minecraft/launch-detached.sh <instance>` (default 26.1.2).
+
+### Wayland
+
+Weston on :1 worked but was removed ("Make X the default"). Old mutter-on-SPI
+segfault (g_str_has_prefix NULL on card0 HDMI disconnect) is moot — the panel no
+longer runs a compositor. Do not reintroduce mutter on the SPI panel.
+
+**Weston DRM-backend as a root service is a dead end for the real display
+(2026-08-06).** Running weston 9 with `--backend=drm-backend.so --tty=1` as a
+root systemd service works once (GPU compositor on DP-1, PowerVR renderer) but
+has NO logind helper (`logind: cannot setup systemd-logind helper (-61), using
+legacy fallback`). In legacy mode weston cannot re-train the eDP/DP link after a
+monitor power-cycle: the connector flaps connected/disconnected and the signal
+never comes back until reboot. gdm/Xorg (logind-managed) handles hotplug fine.
+The one working run showed a grey desktop before power-cycling the monitor made
+it permanent-black. Do NOT put weston on the primary display; keep gdm3.
+
+### GPU research (gpu/)
+
+Offscreen GPU rendering on the PowerVR **works and is fast**: `gpu/pvr_offscreen.c`
++ `gpu/bench.c` render GLES3 on the BXM-4-64 via GBM at **~195-250fps @ 1920x1080**.
+**IMPORTANT (26.04): DRM minor numbering CHANGED after the 22.04→26.04 swap** —
+now `renderD128 = 1800000.gpu` (PowerVR) and `renderD129 = 2543000.spi` (SPI panel);
+on the old 22.04 layout it was the opposite. `bench.c` hardcodes the GPU node
+(`pvr_create("/dev/dri/renderD128", ...)`); the 22.04-era AGENTS text saying
+`renderD129=GPU` is WRONG on the current root. Check with:
+`for r in /sys/class/drm/renderD*; do readlink $r/device; done`.
+Verified 2026-08-08 on 26.04: 195.5 fps @ 1920x1080 (BSP GLES 3.2 build 24.2@6603887).
+with dma-buf export (`EGL_MESA_image_dma_buf_export` import-then-export path).
+The client-side *presentation* surface story is the blocker: BSP EGL has no
+Wayland platform, native IMG Vulkan has no `VK_KHR_wayland_surface`, and the
+GBM→dmabuf→weston import path wedges weston (busy-spins in repaint) because the
+BSP GBM reports modifier `0xffffffffffffff` for rendered buffers while weston
+expects linear/tiled. Zink on system mesa reaches the PowerVR but fails swapchain
+("could not create swapchain" — no wayland surface in the ICD).
+PowerVR is driven ONLY by the vendor BSP stack in /usr/local (GLES/EGL-only).
+
+### Touch / calibration
+
+- ADS7846 touchscreen (`99-ads7846-calibration.conf`): `Floating "false"` (gnome-shell
+  detaches it otherwise), TransformationMatrix identity, libinput Calibration Matrix
+  from calibration.
+- **Calibration**: `minecraft/calibration/calibrate-gui` — fullscreen crosshair GUI
+  that waits indefinitely; touch & hold each corner on the PANEL. Reads real XI
+  device range (65535) — the earlier bug was assuming 4095 (16x wrong scale, all
+  touches collapsed to one corner). Saves profiles to
+  `/home/orangepi/.config/touch-calib/{hdmi,fbcp}.{cal,ctm}`; apply via
+  `/home/orangepi/touch-calib.sh apply hdmi|fbcp` or desktop shortcuts.
+- `show-touches` — draws green crosshair where each touch lands (calibration check).
+- Desktop shortcuts: `calibrate-touch-hdmi.desktop`, `calibrate-touch-fbcp.desktop`,
+  `apply-touch-*.desktop`, `show-touches.desktop`.
+
+## GPU driver provenance (open vs closed)
+
+- **Kernel driver: OPEN SOURCE.** `pvrsrvkm.ko` (loaded, 22 refs) drives
+  `1800000.gpu`. License `Dual MIT/GPL`, author "Imagination Technologies",
+  DKMS source at `/usr/src/img-bxm-dkms-0.1.0-2` (the img-bxm Rogue services
+  kernel module). This is Imagination's official open PowerVR kernel driver.
+- **Userspace: CLOSED.** The `/usr/local` BSP stack (`libEGL/libGLESv2`,
+  `dri/pvr_dri.so`, `libpvr_mesa_wsi.so`) is Imagination's proprietary Rogue
+  user-mode driver (build path `/home/hongyaobin/workspace/gpu_src2/gpu_um_priv/
+  img-bxm/linux/rogue/...`). It is NOT upstream mesa.
+- **Upstream mesa does NOT support PowerVR B-series (BXM-4-64).** Mesa's open
+  `powervr` gallium driver only covers older E-Series GPUs and is incomplete.
+  There is no open userspace for BXE/BXM. So the GPU userspace cannot be
+  open-sourced/replaced; the kernel side already is. Do not try to swap in
+  upstream mesa for the userspace (the GLES-only BSP EGL is the only thing that
+  drives it, see docs/GPU.md).
+
+## Gotchas
+
+- **Session display number moves** (:0 → :2 after Xvfb grabs :1, and back).
+  Everything must auto-detect the display (game-run.sh, spi-mirror-select.sh),
+  never hardcode :0.
+- **Xorg dual-screen config (card0+card1 as two X screens) breaks input** — the
+  mouse/touch gets trapped on the SPI screen. Keep SPI out of X entirely.
+- **gdm XAUTHORITY**: `/run/user/1000/gdm/Xauthority` (user session) or
+  `/run/user/127/gdm/Xauthority` (greeter). Check which is current.
+- **PrismLauncher refuses root**; launch via `su - orangepi -c` (launch-detached.sh).
+- **Stale prismlauncher processes** hold the instance lock; kill all + rm
+  `instances/26.1.2/instance.lock` before relaunch.
+- **libopenal segfaults** (SIGSEGV in `libopenal.so+0x9c670` EffectSlot mixer) with the
+  LWJGL-bundled openal. `ALSOFT_DRIVERS=null` + config `drivers = null` do NOT fix it —
+  the bundled openal crashes processing effect slots regardless. FIXED durably by
+  **patching the natives jar**: replace
+  `libraries/org/lwjgl/lwjgl-openal-natives-linux-arm64/3.4.1-lwjgl.1/...-3.4.1-lwjgl.1.jar`
+  entry `linux/arm64/org/lwjgl/openal/libopenal.so` with
+  `/usr/lib/aarch64-linux-gnu/libopenal.so.1.19.1` and update the `.sha1` (backup kept
+  as `.bundled-bak`). LD_PRELOAD does NOT work (LWJGL re-extracts from jar each launch).
+- **Offline launch (`--offline <name>`) crashes NeoForge** with `MinecraftClientHttpException
+  Status: 401` at `YggdrasilUserApiService.fetchProperties` — NeoForge 26.x requires the
+  Mojang auth service even for a valid session; offline mode aborts during boot.
+  The game ONLY boots with a real MSA account (the account in accounts.json currently has
+  `profileName: None` — needs re-login to Mojang). zink/GPU rendering is confirmed working
+  up to the auth crash (all texture atlases created on PowerVR).
+- **NeoForge early splash window kills zink** (needs GLX): `fml.toml`
+  `earlyWindowControl = false`.
+- **PowerVR native Vulkan ICD (libVK_IMG.so) enumerates but CANNOT present to
+  windows** — no DRI3 on this X stack, 256x256 hard WSI swapchain cap, and the
+  `MESA_VK_WSI_DEBUG=sw` software-present hack segfaults on the native path (only
+  zink's sw-present works). Don't try to "fix" native Vulkan presentation; it is a
+  driver/hardware limit. See docs/GPU.md.
+- **Vulkan only lists PowerVR when the native ICD is the first device**; a plain
+  `vulkaninfo` shows PowerVR BXM-4-64 MC1 (integrated) first, llvmpipe second.
+  Rendering (offscreen/surfaceless) works; windowed present does not.
+- **sudo**: `SUDO_ASKPASS=/home/orangepi/.opencode-askpass sudo -A <cmd>`. NOPASSWD rule
+  at `/etc/sudoers.d/99-orangepi` (orangepi can sudo anything passwordless).
+- **Heredocs via `sudo -A bash -c` eat $variables** — write files with the Write
+  tool, or single-quote the heredoc delimiter.
+- **`pkill -f "Xvfb :1"` from a root shell can hang the shell** (matches itself);
+  use exact PIDs or `pkill -x`.
+
+## Apt / OS version
+
+- OS is **Ubuntu 22.04 Jammy** ("Orange Pi 1.0.0 Jammy"), kernel
+  `6.6.98-sun60iw2` (vendor `linux-image-current-sun60iw2`). BSP GPU stack in
+  /usr/local is NOT dpkg-managed.
+- Sources: vendor `repo.huaweicloud.com/ubuntu-ports` (jammy, in sources.list) +
+  official `ports.ubuntu.com/ubuntu-ports` added via
+  `/etc/apt/sources.list.d/ubuntu-ports.sources` (jammy suites, same components).
+  Both reachable; `apt-get update` works (125MB).
+- **DO NOT `do-release-upgrade` to 24.04/26.04** — the vendor kernel
+  (`sun60iw2`) and PowerVR BSP stack are built for Jammy; 10 vendor packages
+  (`linux-image-current-*`, `linux-headers-current-*`, orangepi-*) would break on
+  Noble, and the board's DRM/display + SPI panel rely on the vendor kernel + dts
+  overlays. 26.04 has no arm64 vendor support. Keep Jammy.
+===SOURCE DIR===
+/home/orangepi/ili9486impl/config/:
+total 68
+drwxr-xr-x  2 orangepi orangepi 4096 Aug  2 00:33 .
+drwxrwxrwx 16 orangepi orangepi 4096 Aug 14 15:12 ..
+-rw-r--r--  1 orangepi orangepi  362 Aug  1 09:05 10-fbdev-lcd.conf
+-rw-r--r--  1 orangepi orangepi  770 Aug  6 05:04 10-lcd-modesetting.conf
+-rw-r--r--  1 orangepi orangepi  163 Aug  1 05:12 99-ads7846-calibration.conf
+-rw-r--r--  1 orangepi orangepi  264 Aug  1 05:19 fan-full.service
+-rw-r--r--  1 orangepi orangepi   79 Aug  1 09:22 gdm3-custom.conf
+-rwxr-xr-x  1 orangepi orangepi  428 Aug  1 05:48 gnome-scaling.sh
+-rwxr-xr-x  1 orangepi orangepi 1083 Aug  1 03:58 ili9486-boot-watchdog.sh
+-rw-r--r--  1 orangepi orangepi  350 Aug  1 17:11 ili9486-crtc-fix.service
+-rw-r--r--  1 orangepi orangepi  420 Aug  1 09:05 ili9486-fb-symlink.service
+-rw-r--r--  1 orangepi orangepi  626 Aug  1 22:58 minecraft-480x320.md
+-rw-r--r--  1 orangepi orangepi  444 Aug  1 23:14 minecraft-java17-fix.md
+-rw-r--r--  1 orangepi orangepi  427 Aug  1 23:08 minecraft-openal-fix.md
+-rw-r--r--  1 orangepi orangepi  443 Aug  1 23:19 minecraft-openal-lib.md
+-rwxr-xr-x  1 orangepi orangepi  207 Aug  1 22:37 prism-launch.sh
+-rw-r--r--  1 orangepi orangepi  307 Aug  1 22:37 prismlauncher.desktop
+
+/home/orangepi/ili9486impl/source/:
+total 112
+drwxr-xr-x  2 orangepi orangepi  4096 Aug  1 01:59 .
+drwxrwxrwx 16 orangepi orangepi  4096 Aug 14 15:12 ..
+-rw-r--r--  1 orangepi orangepi   172 Aug  1 01:59 Makefile
+-rw-r--r--  1 orangepi orangepi   157 Aug  1 01:59 Makefile.ads7846
+-rw-r--r--  1 orangepi orangepi 36035 Aug  1 04:33 ads7846.c
+-rwxr-xr-x  1 orangepi orangepi 41769 Aug  1 11:11 drm_mipi_dbi.c
+-rwxr-xr-x  1 orangepi orangepi  7412 Aug  1 04:27 drm_mipi_dbi.h
+-rwxr-xr-x  1 orangepi orangepi  8003 Aug  2 00:16 ili9486.c
