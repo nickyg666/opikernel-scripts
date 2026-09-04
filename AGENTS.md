@@ -12,7 +12,17 @@ Everything needed to resume the project from a cold start. More detail in `docs/
   - SSH: `sshpass -p orangepi ssh -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no -o Tunnel=no -o ConnectTimeout=8 orangepi@192.168.0.151`
   - Root: `echo orangepi | sudo -S <cmd>`
   - Kernel `6.18.19+ #12`, AC101 dtb active, stable (no 22s panic; up for hours)
-- **Watcher**: `192.168.0.167`, user/pass `orangepi/orangepi`, sudo same
+- **Serial console (PRIMARY, since Aug 27)**: pico USB-serial bridge on the HOST
+  (.168) — picoprobe `2e8a:000a` exposing `/dev/ttyACM0` wired to the board's UART
+  pins @115200. Nick built this to replace the watcher UART; no second UART
+  connection is needed. Capture: `sudo stty -F /dev/ttyACM0 115200 raw -echo` then
+  `sudo setsid bash -c 'exec cat /dev/ttyACM0 >> /home/host/pvrgl-work/sercap2.log'`
+  (persistent dir, NOT /tmp — /tmp wipes lose boot evidence). Writes to the port
+  need root/sudo (crw-rw---- root:dialout). Commands are paced ~0.2s apart one
+  line per write; output appears in the capture file. Enter-spam loop
+  (~44×0.25s starting 2-3s after power-on) catches the U-Boot autoboot window.
+- **Watcher (SECONDARY, offline since Aug 27)**: `192.168.0.167`, user/pass
+  `orangepi/orangepi`, sudo same
   - Serial capture log grows: `/home/orangepi/uart_capture/ttyS0.log` (must run as root, see docs/WATCHER-SERIAL.md)
 - **Host (this machine)**: `/home/tab`
   - Kernel source: `/home/tab/kernel-build/mainline-6.18`
