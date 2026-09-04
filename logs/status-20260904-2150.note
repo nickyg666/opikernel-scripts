@@ -1,0 +1,44 @@
+2026-09-04 21:50 cron: BOARD .151 — KERNEL PANIC on AIC8800 SDIO WiFi module (REPRODUCIBLE)
+
+Context: Board was DOWN since ~17:00 Sep 4 per M3-5 plan. Smartplug off->wait->on -> board boots
+to userspace, but kernel panics on WiFi module probe. Pattern repeats across power cycles.
+
+Evidence (serial captures, pico ttyACM0 @115200):
+
+  sercap_reboot.log (cycle 1):
+    - 6.18.19+ #15 boots, root switched /dev/mmcblk1p1 fine
+    - aic8800_bsp + aic8800_fdrv + aic8800_btlpm load
+    - rwnx_platform_on -> rwnx_plat_fmac_load -> userconfig OK
+    - rwnx_send_reset/version/me_config_req all OK
+    - rwnx_dbgfs_register: wlan0 added (a8:13:32:9c:8c:c0)
+    - udev fires, sssd deps fail (jammy systemd bloat, harmless)
+    - 23.5s: Oops in wrapper-2.0 process (snap wrapper) -> free_pgtables
+      pc: free_pgtables+0x224/0x280  -> pgd=0000000000000000
+      Kernel panic - not syncing. SMP stopped.
+
+  sercap_cyc2.log (cycle 2 after full off->on):
+    - SAME path until aicbt_patch_table_load (BT firmware)
+    - 9.96s: Oops in (udev-worker) PID 242 -> new_inode+0x38/0x60
+      address ffe0ff80c3510198 (between user/kernel ranges) -> WnR=1
+      Tainted: G O (aic8800_fdrv OOT module)
+      Same crash site as sercap-465-nobtlpm1.log (mmc2:155e probe path)
+
+Root cause: aic8800_fdrv SDIO + shmem_mknod (sysfs node creation in driver probe)
+triggers new_inode Oops. Reproducible across reboots. This is the
+"vqmmc-supply missing 1.8V switch" UHS-corruption signature triggering NULL/bad
+page-table walk, or an actual driver bug in the OOT AIC8800 module.
+
+Recovery options for Nick (require physical or domain action):
+  1. Disable aic8800_fdrv at boot (modprobe.blacklist=aic8800_fdrv) so board
+     comes up without WiFi; SSH/serial usable, can investigate driver bug.
+  2. Patch DTB: status="disabled" on mmc2 node (kills WiFi but board boots).
+  3. Apply mmc2 max-frequency=50000000 cap (the no-UHS rescue pattern from
+     status-20260830-0005.note). Did NOT help here — both caps had crash.
+  4. Rebuild aic8800_fdrv against 6.18 with the shmem_mknod null-pgd fix.
+
+Mesa/pvrgl state unchanged: HEAD = 4eb65e22fd7 (M3 PASS), no new commits.
+pvrgl-m2 branch clean, m3.5-wip not started. Mesa on board is /opt/mesa-gpu
+which would still need a board to test against.
+
+Action: NO further reboots — pattern is reproducible, don't wear storage.
+Wait for Nick to pick: blacklist module OR fix driver.
