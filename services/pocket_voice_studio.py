@@ -202,14 +202,37 @@ def del_voice(name: str):
 
 
 @app.post("/api/generate")
-def generate(text: str = Form(...), voice: str = Form(None)):
+def generate(text: str = Form(...), voice: str = Form(None),
+             voice_ref: str = Form(None)):
+    """Generate speech.
+
+    voice     -- a registered voice name (the studio's own clip is used)
+    voice_ref -- a reference clip to clone zero-shot, used INSTEAD of the
+                 registered voice when present. This is what lets a book be
+                 narrated in the author's own voice without registering it.
+    """
     s = _load_settings()
     voice = voice or s.get("pocket_voice")
-    if not voice:
-        raise HTTPException(400, "no voice selected")
-    ref = os.path.join(VOICES_DIR, voice, "reference.wav")
-    if not os.path.exists(ref):
-        raise HTTPException(404, f"voice '{voice}' missing reference.wav")
+
+    # Zero-shot path: a caller-supplied reference wins over any registered
+    # voice, because pocket_tts clones from the clip either way and the clip
+    # IS the voice.
+    if voice_ref:
+        ref = voice_ref
+        if not os.path.isabs(ref):
+            # a bare name resolves inside the voices directory
+            ref = os.path.join(VOICES_DIR, ref)
+        if not os.path.exists(ref):
+            raise HTTPException(
+                404, f"voice_ref '{voice_ref}' not found (looked at {ref})")
+        if not os.path.isfile(ref):
+            raise HTTPException(400, "voice_ref must be a file")
+    else:
+        if not voice:
+            raise HTTPException(400, "no voice selected and no voice_ref given")
+        ref = os.path.join(VOICES_DIR, voice, "reference.wav")
+        if not os.path.exists(ref):
+            raise HTTPException(404, f"voice '{voice}' missing reference.wav")
     try:
         with urllib.request.urlopen(_multipart(text=text[:2000], wav_path=ref),
                                     timeout=300) as resp:
