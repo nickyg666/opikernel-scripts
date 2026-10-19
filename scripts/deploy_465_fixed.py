@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""deploy_465_fixed.py — Deploy boot.scr.465-fixed as boot.scr on SD, then boot vendor.
+Usage: sudo python3 deploy_465_fixed.py
+"""
+import serial, sys, time, os, subprocess, base64
+
+DEV = "/dev/ttyACM0"
+BAUD = 115200
+LOG = "/home/host/pvrgl-work/deploy_465_fixed.log"
+
+logf = open(LOG, 'wb', buffering=0)
+def log(msg):
+    ts = time.strftime('%H:%M:%S')
+    line = f"[{ts}] {msg}\n"
+    sys.stdout.write(line); sys.stdout.flush()
+    logf.write(line.encode('utf-8')); logf.flush()
+
+def drain(ser):
+    for _ in range(20):
+        if ser.in_waiting:
+            ser.read(ser.in_waiting)
+        time.sleep(0.1)
+
+def send_cmd(ser, cmd, wait=3.0):
+    ser.write(cmd.encode() + b'\r')
+    time.sleep(0.1)
+    out = b''
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if ser.in_waiting:
+            out += ser.read(ser.in_waiting)
+        time.sleep(0.05)
+    return out.decode('utf-8', errors='replace')
+
+def wait_for(ser, patterns, timeout=30):
+    start = time.time()
+    buf = b''
+    while time.time() - start < timeout:
+        if ser.in_waiting:
+            data = ser.read(ser.in_waiting)
+            buf += data
+            decoded = buf.decode('utf-8', errors='replace')
+            for p in patterns:
+                if p in decoded:
+                    return p, decoded
+        time.sleep(0.05)
+    return None, buf.decode('utf-8', errors='replace')
+
+log("Killing readers...")
+subprocess.run("sudo /home/host/opikernel/scripts/claim-serial-port.sh >/dev/null 2>&1", shell=True)
+time.sleep(2)
+
+log("Opening serial...")
+ser = serial.Serial(DEV, BAUD, timeout=1)
+ser.dtr = False; ser.rts = False
+time.sleep(0.5)
+drain(ser)
+
+log("Power cycle...")
+subprocess.run(["/usr/bin/python3","/home/host/opikernel/scripts/host/smartplug.py","off","--model","WLPP1CFH","D03F271583AE"], capture_output=True)
+time.sleep(5)
+subprocess.run(["/usr/bin/python3","/home/host/opikernel/scripts/host/smartplug.py","on","--model","WLPP1CFH","D03F271583AE"], capture_output=True)
+
+log("Waiting for U-Boot...")
+pat, _ = wait_for(ser, ['Hit any key', '=>'], timeout=30)
+if not pat:
+    log("FAILED: No prompt"); logf.close(); ser.close(); sys.exit(1)
+log(f"Found '{pat}' — break...")
+ser.break_condition = True; time.sleep(0.05); ser.break_condition = False
+time.sleep(0.3); ser.write(b'\r'); time.sleep(1.0)
+drain(ser); time.sleep(2)
+
+# Load 465-fixed into RAM
+log("Loading 465-fixed into RAM...")
+resp = send_cmd(ser, "ext4load mmc 0:1 0x43200000 /boot/boot.scr.465-fixed", 10)
+log(f"  Result: {resp.strip()[:100]}")
+
+# Write to /boot/boot.scr using ymodem approach via base64
+# We'll use the fact that ext4write failed due to offset.
+# Alternative: use the "fatwrite" equivalent or just source the script directly
+# But we want it to persist across reboots.
+# Let's try: since ext4write needs 0 offset, try creating the file first
+log("Attempting to write boot.scr...")
+
+# First, try creating an empty file then writing
+send_cmd(ser, "ext4write mmc 0:1 0x43200000 /boot/boot.scr 0 0", 10)
+
+# Now write the actual content
+log("Writing 465-fixed content to /boot/boot.scr...")
+resp = send_cmd(ser, "ext4write mmc 0:1 0x43200000 /boot/boot.scr 0 6350", 15)
+log(f"  ext4write: {resp.strip()[:200]}")
+
+# Verify
+resp = send_cmd(ser, "ext4size mmc 0:1 /boot/boot.scr", 5)
+log(f"  ext4size: {resp.strip()}")
+
+# Now source 465-fixed and boot
+log("Sourcing 465-fixed...")
+ser.write(b'source 0x43200000\r')
+time.sleep(5)
+drain(ser)
+
+# Watch boot
+log("Watching boot (180s)...")
+boot_start = time.time()
+userspace = False
+while time.time() - boot_start < 180:
+    if ser.in_waiting:
+        data = ser.read(ser.in_waiting)
+        decoded = data.decode('utf-8', errors='replace')
+        logf.write(decoded.encode('utf-8', errors='replace')); logf.flush()
+        if 'login:' in decoded:
+            userspace = True; log("*** USERSAPCE ***"); break
+        if 'Kernel panic' in decoded:
+            log("*** PANIC ***"); break
+    time.sleep(0.05)
+
+logf.close(); ser.close()
+time.sleep(5)
+ssh_ok = subprocess.run(["ping","-c","3","-W","2","192.168.0.151"], capture_output=True).returncode == 0
+log(f"\nRESULT: SSH={ssh_ok} userspace={userspace}")
+log(f"Log: {LOG} ({os.path.getsize(LOG)} bytes)")

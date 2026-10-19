@@ -1,0 +1,52 @@
+# python bytecode
+__pycache__/
+*.py[cod]
+
+# build / packaging noise
+*.egg-info/
+.venv/
+venv/
+
+# This repo tracks the OPERATIONAL surface: scripts/ (what cron and systemd
+# call), config/, docs/ and services/. Everything else is either a large
+# binary, a build tree, a card image or scratch state that has its own home:
+#
+#   artifacts/ archives/ gpu-stage/ board-files/   -> built binaries, moved here
+#   backups/ stage/ staging/ state/ builds/ logs/  -> images, staging, scratch
+#   kernel-trees/                                  -> symlink to /home/host/kernel-trees
+#   aic8800-*/ dkms/ bundles/ artifacts-7.3-*/     -> their own git repos
+#
+# They are deliberately NOT tracked here. The kernel tree and the aic8800
+# driver are pushed from their own repos (see docs/LAYOUT.md).
+artifacts/
+archives/
+gpu-stage/
+board-files/
+backups/
+stage/
+staging/
+state/
+builds/
+logs/
+bundles/
+dkms/
+aic8800-pkg/
+aic8800-sun60iw2-patches/
+aic8800-sun60iw2-src/
+artifacts-7.3-19b8072e/
+artifacts-7.3-working/
+.build-engineer-backups/
+.config
+.config-73-base
+.last_gate_result
+.tmp
+screenlog.t0
+
+# NEVER commit credentials or service state
+services/homeassistant/config/.storage/
+services/homeassistant/config/*.db
+services/**/.storage/
+*.secret
+.env
+x-chrome-coop/
+x-chrome-coop-pkg/

@@ -1,0 +1,147 @@
+#!/bin/bash
+# Agent watchdog — resumes genuinely-stalled group-chat (gc_) sessions.
+# Cron: */2 * * * *   (installed as a NO-AGENT script job: zero inference per tick)
+#
+# Design rules learned the hard way:
+#  1. ONE nudge per agent per tick — the old query resumed every open session of
+#     an agent, so a restart spawned 5 sibling sessions doing the same job.
+#  2. NEVER nudge a session whose last user turn is our OWN nudge text ("Continue."
+#     / "Please continue."). Without that guard the watchdog feeds its own output
+#     back in and loops forever (hundreds of junk "Please provide the context...").
+#  3. Nudge text must be a REAL instruction — a bare "Continue." on a cold session
+#     produces "please provide context" spam instead of work.
+#  4. An agent's stall is only real if its NEWEST open session is stale. Older
+#     superseded sessions are abandoned on purpose; leave them alone.
+#  5. Model/provider pinned explicitly. A bare `-m freecode` with no provider
+#     drifts to whatever cron.model happens to be and fails silently.
+#
+# Env overrides (used for verification, not production):
+#   DRY_RUN=1        print the selection and exit (no nudges fired)
+#   WATCHDOG_DB=path query a different state.db (fixture testing)
+export PATH="/home/host/.local/bin:$PATH"
+LOG=/home/host/opikernel/logs/agent-watchdog.log
+STATE=/home/host/opikernel/scripts/agent-watchdog-state.json
+DB="${WATCHDOG_DB:-/home/host/.hermes/state.db}"
+STALE_MIN=8          # resume if no activity in 8 minutes
+GAP_MIN=5            # don't re-nudge same session within 5 min
+MAX_NUDGE=3          # max nudges per tick
+MAX_CONCURRENT=3     # max concurrent `hermes chat` processes
+NUDGE_MODEL="${WATCHDOG_MODEL:-omni/freeAF}"
+NUDGE_PROVIDER="${WATCHDOG_PROVIDER:-custom:neato}"
+# Text that IS the watchdog — never treat it as a live user turn
+SELF_NUDGE_RE='^(Continue\.?|continue\.?|Please continue\.?|Keep going\.?)$'
+
+mkdir -p "$(dirname "$LOG")" "$(dirname "$STATE")"
+cd /home/host || exit 0
+
+# Flock: never stack watchdog runs
+LOCK=/home/host/opikernel/scripts/agent-watchdog.lock
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "[$(date)] another watchdog instance already running; exiting" >> "$LOG"
+    exit 0
+fi
+
+# --- Serial-runaway reaper -------------------------------------------------
+# Resumed sessions leave long-lived `cat /dev/ttyACM0` readers behind; a swarm of
+# them holds the pico port and fakes "PIPELINE-DIED / board hung at U-Boot".
+# NEVER `pkill -f 'cat /dev/ttyACM0'` — that pattern also matches the invoking
+# shell's own cmdline and SIGTERMs the caller. Use the PID-aware reaper.
+REAPER=/home/host/opikernel/scripts/kill-serial-runaways.py
+if [ -x "$REAPER" ]; then
+    N=$(sudo -n python3 "$REAPER" 2>/dev/null | head -1)
+    case "$N" in
+        "killed 0 "*) : ;;                       # nothing to do, stay quiet
+        *killed*) echo "[$(date)] serial-runaway reaper: $N" >> "$LOG" ;;
+    esac
+fi
+
+if [ ! -f "$STATE" ]; then echo '{}' > "$STATE"; fi
+NOW=$(date +%s)
+
+# Candidate selection is done in python: per-agent dedup + self-nudge filter
+# need real parsing, not sqlite string munging.
+CANDS=$(timeout 60 python3 - "$DB" "$NOW" "$STALE_MIN" "$SELF_NUDGE_RE" <<'PYEOF' 2>/dev/null
+import sqlite3, sys, re
+db, now, stale_min, self_re = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+self_pat = re.compile(self_re, re.I)
+con = sqlite3.connect(db)
+rows = con.execute("""
+  SELECT m.session_id, max(m.timestamp) AS last_ts
+  FROM messages m JOIN sessions s ON s.id = m.session_id
+  WHERE m.session_id LIKE 'gc_%' AND s.ended_at IS NULL
+  GROUP BY m.session_id
+""").fetchall()
+best = {}          # agent -> (last_ts, sid)
+for sid, last_ts in rows:
+    if last_ts is None or (now - last_ts) < stale_min * 60:
+        continue
+    last = con.execute(
+        "SELECT role, coalesce(content,'') FROM messages WHERE session_id=? ORDER BY timestamp DESC LIMIT 1",
+        (sid,)).fetchone()
+    if not last:
+        continue
+    role, content = last[0], last[1]
+    if role != 'user':
+        continue                      # agent is mid-turn or already answered
+    if self_pat.match(content.strip()):
+        continue                      # this turn IS our own nudge — don't loop
+    # agent name = session id minus gc_run_<room>_<profile>_ prefix and _<hex> suffix
+    body = re.sub(r'^gc_run_[^_]+_[^_]+_', '', sid)
+    agent = re.sub(r'_[0-9a-f]{16,}$', '', body)
+    prev = best.get(agent)
+    if prev is None or last_ts > prev[0]:
+        best[agent] = (last_ts, sid)
+for agent, (ts, sid) in sorted(best.items(), key=lambda kv: -kv[1][0]):
+    print(f"{sid}|{agent}|{int((now - ts)/60)}")
+PYEOF
+)
+
+if [ -z "$CANDS" ]; then
+    exit 0
+fi
+
+# DRY_RUN=1 -> report candidates and exit (used to verify selection logic
+# without firing any nudge). Keep it — it is how this script gets re-validated.
+if [ -n "$DRY_RUN" ]; then
+    echo "$CANDS"
+    exit 0
+fi
+
+RUNNING=$(pgrep -c -f 'hermes chat' 2>/dev/null | tr -dc '0-9'); RUNNING=${RUNNING:-0}; [ -z "$RUNNING" ] && RUNNING=0
+if [ "$RUNNING" -ge "$MAX_CONCURRENT" ]; then
+    echo "[$(date)] $RUNNING hermes chat processes already running (cap $MAX_CONCURRENT); skipping" >> "$LOG"
+    exit 0
+fi
+
+NUDGED=0
+while IFS='|' read -r sid agent age_min; do
+    [ -z "$sid" ] && continue
+    [ "$NUDGED" -ge "$MAX_NUDGE" ] && break
+
+    last_nudged=$(python3 -c "import sys,json;print(int(json.load(open('$STATE')).get('$sid',0)))" 2>/dev/null || echo 0)
+    nudge_gap=$(( (NOW - last_nudged) / 60 ))
+    if [ "$nudge_gap" -lt "$GAP_MIN" ]; then
+        continue
+    fi
+
+    echo "[$(date)] Resuming stale agent '$agent' session $sid (${age_min}m idle) model=$NUDGE_MODEL provider=$NUDGE_PROVIDER" >> "$LOG"
+    # Real instruction, not a bare "Continue." — a cold session needs the job restated.
+    hermes chat -Q --resume "$sid" -m "$NUDGE_MODEL" --provider "$NUDGE_PROVIDER" \
+        -q "You are the group-chat agent '$agent' in room mti5ax1clq0zlx. Your last turn was interrupted or stalled (${age_min}m idle). Resume your assigned duties now: state what you were doing, re-run the last verification command, and post your result to the group chat with gc-say. Do not ask for context — you have it." \
+        >> "$LOG" 2>&1 &
+
+    python3 - "$STATE" "$sid" "$NOW" <<'PYEOF' 2>/dev/null
+import json, sys, os
+state, sid, now = sys.argv[1], sys.argv[2], float(sys.argv[3])
+try:
+    d = json.load(open(state))
+except Exception:
+    d = {}
+d[sid] = now
+open(state + ".tmp", "w").write(json.dumps(d))
+os.replace(state + ".tmp", state)
+PYEOF
+    NUDGED=$((NUDGED + 1))
+    sleep 1
+done <<< "$CANDS"

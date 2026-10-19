@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Detect idle agents in hermes group-chat rooms (multi-room).
+Reads env: DB_GC=/home/host/.hermes-web-ui/hermes-web-ui.db
+Writes /home/host/opikernel/state/orchestrator.json with per-room stale/active/blockers.
+
+New in group mode: loops ALL rooms in gc_rooms, not just one ROOM_ID.
+Auto-clears is handled by the shell wrapper, not here.
+"""
+import os, sqlite3, json, time, sys
+
+db_gc = os.environ.get("DB_GC", "/home/host/.hermes-web-ui/hermes-web-ui.db")
+idle_min = int(os.environ.get("IDLE_MIN", "15"))
+block_age_min = int(os.environ.get("BLOCK_AGE_MIN", "10"))
+now_ms = int(time.time() * 1000)
+now_s = time.time()
+
+blocker_keys = ("waiting on", "blocked by", "needs review", "stuck",
+                "unclear", "depends on", "blocker:")
+
+try:
+    con = sqlite3.connect(db_gc)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+except Exception as e:
+    print(f"DB open failed: {e}", file=sys.stderr)
+    sys.exit(1)
+
+# discover rooms
+try:
+    rooms = [r[0] for r in cur.execute("SELECT id FROM gc_rooms").fetchall()]
+except Exception as e:
+    print(f"rooms query failed: {e}", file=sys.stderr)
+    sys.exit(1)
+
+# --- room targeting (2026-09-18) -------------------------------------------
+# BUG THIS FIXES: this detector looped ALL rooms in gc_rooms, so the every-minute
+# poller nudged a DORMANT room (Neorunner, last agent traffic 16h+, human never
+# posts) whose 6 agents are permanently "stale". Result: 8,748 nudges, a fresh
+# YOLO agent session every 60s, and board power-cycle reports posted into that
+# dead room instead of the live project room. The room that matters never got a
+# nudge. Rooms are now selected by ATTENDANCE:
+#   * ORCH_ROOMS (space/comma list) -> authoritative allowlist when set
+#   * ORCH_ROOMS_EXCLUDE            -> explicit kill list
+#   * otherwise: a room is processed only if a NON-AGENT participant (a human)
+#     has posted in it within ROOM_HUMAN_MIN minutes. Agents nudge themselves
+#     into a loop; a room with no human is a room nobody is waiting on.
+attended_min = int(os.environ.get("ROOM_HUMAN_MIN", "2880"))   # 48h
+allow = (os.environ.get("ORCH_ROOMS", "") or "").replace(",", " ").split()
+deny = set((os.environ.get("ORCH_ROOMS_EXCLUDE", "") or "").replace(",", " ").split())
+skipped = {}
+selected = []
+for room in rooms:
+    if allow and room not in allow:
+        skipped[room] = "not-in-ORCH_ROOMS"
+        continue
+    if room in deny:
+        skipped[room] = "excluded"
+        continue
+    agent_names = {r[0] for r in cur.execute(
+        "SELECT name FROM gc_room_agents WHERE roomId=?", (room,)).fetchall()}
+    row = cur.execute("""
+        SELECT senderName, timestamp FROM gc_messages
+        WHERE roomId=? AND content NOT LIKE '[orchestrator %'
+          AND senderName NOT IN ('admin','orchestrator')
+        ORDER BY timestamp DESC LIMIT 200
+    """, (room,)).fetchall()
+    last_human = 0
+    for r in row:
+        if r["senderName"] not in agent_names:
+            last_human = r["timestamp"] or 0
+            break
+    age_min = (now_ms - last_human) / 60000.0 if last_human else 99999.0
+    if not allow and age_min > attended_min:
+        skipped[room] = f"unattended (no human post in {age_min/60:.1f}h)"
+        continue
+    selected.append(room)
+
+for r, why in skipped.items():
+    print(f"SKIP room {r}: {why}", file=sys.stderr)
+rooms = selected
+
+if not rooms:
+    out = {"rooms": {}, "skipped": skipped, "ts": now_s}
+    print(json.dumps(out, indent=2))
+    with open("/home/host/opikernel/state/orchestrator.json", "w") as f:
+        json.dump(out, f)
+    sys.exit(0)
+
+out = {"rooms": {}, "skipped": skipped, "ts": now_s,
+       "idle_min": idle_min, "block_age_min": block_age_min}
+
+for room in rooms:
+    agents = list(cur.execute("SELECT agentId, name FROM gc_room_agents WHERE roomId=?", (room,)).fetchall())
+    if not agents:
+        continue
+    stale, active, blockers = [], [], []
+    for agent_id, name in agents:
+        # last execution for this agent in this room
+        row = cur.execute("""
+            SELECT status, createdAt, finishedAt, lastError
+            FROM gc_execution_queue
+            WHERE roomId=? AND targetAgentId=?
+            ORDER BY createdAt DESC LIMIT 1
+        """, (room, agent_id)).fetchone()
+        if row is None:
+            # never executed -> treat as stale (needs kick)
+            stale.append([name, 9999.0, None])
+            continue
+        status, created_at, finished_at, last_err = row["status"], row["createdAt"], row["finishedAt"], row["lastError"]
+        # use finishedAt if completed, else createdAt
+        last_ts = finished_at if finished_at else created_at
+        if not last_ts:
+            last_ts = created_at or 0
+        age_min = (now_ms - last_ts) / 60000.0 if last_ts else 9999.0
+
+        # also check last message content for blocker keywords
+        msg_row = cur.execute("""
+            SELECT content FROM gc_messages
+            WHERE roomId=? ORDER BY timestamp DESC LIMIT 1
+        """, (room,)).fetchone()
+        last_msg = (msg_row["content"] if msg_row and msg_row["content"] else "")[:200] if msg_row else ""
+
+        # status logic
+        if status == "pending":
+            # still pending -> not stale, but could be stuck if pending > idle_min
+            if age_min > idle_min:
+                low = (last_msg or last_err or "").lower()
+                if any(k in low for k in blocker_keys):
+                    blockers.append([name, round(age_min, 1), last_msg or last_err])
+                else:
+                    # pending too long -> treat as stale (needs nudge/requeue)
+                    stale.append([name, round(age_min, 1), last_msg or last_err])
+            else:
+                active.append([name, round(age_min, 1), status])
+        elif status in ("completed", "failed"):
+            if age_min > idle_min:
+                low = (last_msg or "").lower()
+                if any(k in low for k in blocker_keys):
+                    blockers.append([name, round(age_min, 1), last_msg])
+                else:
+                    stale.append([name, round(age_min, 1), last_msg])
+            else:
+                active.append([name, round(age_min, 1), last_msg[:80] if last_msg else status])
+        else:
+            active.append([name, round(age_min, 1), status])
+
+    # also check if handoff chain is stuck (depth == maxDepth and stopped)
+    stuck_chain = cur.execute("""
+        SELECT chainId, currentDepth, maxDepth, stopReason, status
+        FROM gc_handoff_chains
+        WHERE roomId=? AND status='stopped' AND stopReason='max_depth'
+        ORDER BY createdAt DESC LIMIT 1
+    """, (room,)).fetchone()
+    chain_info = dict(stuck_chain) if stuck_chain else None
+
+    out["rooms"][room] = {
+        "stale": stale,
+        "active": active,
+        "blockers": blockers,
+        "chain_stuck": chain_info,
+        "agent_count": len(agents)
+    }
+
+with open("/home/host/opikernel/state/orchestrator.json", "w") as f:
+    json.dump(out, f, default=str)
+
+print(json.dumps(out, indent=2))

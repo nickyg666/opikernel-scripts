@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""uboot_sd_inspect.py — Inspect SD card from U-Boot shell, fix boot files."""
+import serial, sys, time, signal, subprocess, os
+
+DEV = "/dev/ttyACM0"
+BAUD = 115200
+LOG = "/home/host/pvrgl-work/uboot_sd_inspect.log"
+
+def signal_handler(sig, frame):
+    print("\n[interrupted]")
+    sys.exit(0)
+signal.signal(signal.SIGINT, signal_handler)
+
+# Kill existing readers
+subprocess.run("sudo /home/host/opikernel/scripts/claim-serial-port.sh >/dev/null 2>&1", shell=True)
+
+# Start background logger
+pid = os.fork()
+if pid == 0:
+    os.close(0); os.close(1); os.close(2)
+    os.open('/dev/null', os.O_RDONLY)
+    os.open('/dev/null', os.O_WRONLY)
+    os.open('/dev/null', os.O_WRONLY)
+    child_ser = serial.Serial(DEV, BAUD, timeout=1)
+    with open(LOG, 'wb') as lf:
+        while True:
+            if child_ser.in_waiting:
+                data = child_ser.read(child_ser.in_waiting)
+                lf.write(data); lf.flush()
+            time.sleep(0.05)
+    sys.exit(0)
+
+time.sleep(1)
+
+ser = serial.Serial(DEV, BAUD, timeout=1)
+ser.dtr = False; ser.rts = False
+time.sleep(0.5)
+# Drain
+if ser.in_waiting: ser.read(ser.in_waiting)
+
+def send_cmd(cmd, wait=2.0):
+    """Send command, return decoded output."""
+    ser.write(cmd.encode() + b'\r')
+    time.sleep(0.1)
+    out = b''
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if ser.in_waiting:
+            out += ser.read(ser.in_waiting)
+        time.sleep(0.05)
+    return out.decode('utf-8', errors='replace')
+
+# Power cycle first
+print(f"[{time.strftime('%H:%M:%S')}] Power cycling...")
+subprocess.run(["/usr/bin/python3","/home/host/opikernel/scripts/host/smartplug.py","off","--model","WLPP1CFH","D03F271583AE"], capture_output=True)
+time.sleep(5)
+subprocess.run(["/usr/bin/python3","/home/host/opikernel/scripts/host/smartplug.py","on","--model","WLPP1CFH","D03F271583AE"], capture_output=True)
+
+# Wait for U-Boot
+print(f"[{time.strftime('%H:%M:%S')}] Waiting for U-Boot prompt...")
+start = time.time()
+while time.time() - start < 30:
+    if ser.in_waiting:
+        data = ser.read(ser.in_waiting)
+        decoded = data.decode('utf-8', errors='replace')
+        print(decoded, end='', flush=True)
+        if 'Hit any key' in decoded:
+            print(f"\n[PROMPT at +{time.time()-start:.1f}s] Sending break...")
+            ser.break_condition = True; time.sleep(0.05); ser.break_condition = False
+            time.sleep(0.3)
+            ser.write(b'\r'); time.sleep(1.0)
+            if ser.in_waiting: ser.read(ser.in_waiting)
+            break
+        elif '=>' in decoded:
+            break
+    time.sleep(0.05)
+
+time.sleep(2)
+# Drain
+if ser.in_waiting: ser.read(ser.in_waiting)
+print(f"\n[{time.strftime('%H:%M:%S')}] U-Boot shell ready. Inspecting SD...\n")
+
+# Inspect SD card
+commands = [
+    ("mmcinfo", 2.0),
+    ("ls mmc 0:1 /", 3.0),
+    ("ls mmc 0:1 /boot", 3.0),
+    ("ls mmc 0:1 /boot/mainline", 3.0),
+    ("ls mmc 0:1 /boot/vendor", 3.0),
+    ("ls mmc 0:1 /boot/dtb", 3.0),
+    ("ls mmc 0:1 /boot/dtb/allwinner", 3.0),
+    ("ls mmc 0:1 /boot/dtb/allwinner/overlay", 3.0),
+]
+
+for cmd, wait in commands:
+    print(f">>> {cmd}")
+    resp = send_cmd(cmd, wait)
+    # Filter out prompt echo and blank lines
+    for line in resp.split('\r'):
+        line = line.strip()
+        if line and '=>' not in line:
+            print(f"    {line}")
+    print()
+    time.sleep(0.5)
+
+# Also print full log
+ser.close()
+time.sleep(1)
+with open(LOG, 'rb') as f:
+    content = f.read().decode('utf-8', errors='replace')
+
+print(f"\n=== FULL LOG ({os.path.getsize(LOG)} bytes) ===")
+print(content[-3000:])

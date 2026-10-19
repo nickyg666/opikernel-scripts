@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Unify agentic-pool/BACKLOG.md (canonical kernel queue) -> ~/.hermes/kanban.db (live board).
+
+Idempotent: keyed on tasks.idempotency_key = "backlog:<BL-id>". Re-runs only sync
+title/status/assignee, never duplicate. Owner: TelegramRunner.
+"""
+import fcntl
+import hashlib
+import os
+import re
+import sqlite3
+import time
+
+BACKLOG = "/home/host/opikernel/agentic-pool/BACKLOG.md"
+DB = "/home/host/.hermes/kanban.db"
+LOCK = "/home/host/.hermes/kanban.backlog-sync.lock"
+
+# Foreign key schemes for the SAME source file. Two agents synced BACKLOG into the board
+# with different dedupe keys on 2026-09-19 (TelegramRunner `backlog:BL-NN`, PA
+# `bl-bl-NN-<hash>`) -> every item landed twice. Canonical key is `backlog:BL-NN`;
+# anything else matching this pattern is reaped unless it is the only row for that item.
+FOREIGN_RE = re.compile(r"^(?:bl-bl-\d+-|bl-|backlog[-_])", re.I)
+
+STATUS_MAP = {"open": "ready", "claimed": "in_progress", "blocked": "blocked", "done": "done",
+              "ready": "ready", "in_progress": "in_progress"}
+
+# Owner of record for items nobody has claimed yet. Keeps the gateway dispatcher
+# (kanban.dispatch_in_gateway: true) from handing a leased-resource task to a random worker:
+# BL-16/BL-17 need the card reader + board lease, which TelegramRunner owns.
+OWNER = {
+    "BL-14": "kernel-architect",
+    "BL-15": "kernel-architect",
+    "BL-16": "TelegramRunner",
+    "BL-17": "TelegramRunner",
+    "BL-18": "build-engineer",
+    # BL-19 was routed to "network-architect": that hyphenated name exists in NO room
+    # (the spaced form "network architect" lives only in mti3yr2g3yjpyr/Neorunner), so the
+    # route was undeliverable. OWNER values must be live roster names of the room that runs
+    # the item — BL-19 (aic8800 SDIO 7.3 module) is the kernel-architect lane in KernelDev-GPU.
+    "BL-19": "kernel-architect",
+}
+
+
+def parse_backlog(path=BACKLOG):
+    items = []
+    cur = None
+    for line in open(path, encoding="utf-8", errors="replace"):
+        m = re.match(r"^### (BL-\d+)\s+(.*)$", line)
+        if m:
+            if cur:
+                items.append(cur)
+            cur = {"id": m.group(1), "title": m.group(2).strip(), "status": None,
+                   "claimed_by": None, "detail": [], "blocker": None}
+            continue
+        if cur is None:
+            continue
+        s = re.match(r"^status:\s*(\S+)", line)
+        if s and cur["status"] is None:
+            cur["status"] = s.group(1).strip()
+            continue
+        c = re.match(r"^claimed-by:\s*(.+)$", line)
+        if c and cur["claimed_by"] is None:
+            cur["claimed_by"] = c.group(1).strip()
+            continue
+        b = re.match(r"^blocker:\s*(.+)$", line)
+        if b and cur["blocker"] is None:
+            cur["blocker"] = b.group(1).strip()
+    if cur:
+        items.append(cur)
+    return items
+
+
+def short_id(bl_id):
+    return "bl_" + hashlib.sha1(bl_id.encode()).hexdigest()[:8]
+
+
+def _event(con, task_id, kind, now, payload=None):
+    con.execute("insert into task_events (task_id,run_id,kind,payload,created_at) "
+                "values (?,?,?,?,?)", (task_id, None, kind, payload, now))
+
+
+def _has_sticky_block(con, task_id):
+    r = con.execute("select kind from task_events where task_id=? and kind in "
+                    "('blocked','unblocked') order by id desc limit 1", (task_id,)).fetchone()
+    return bool(r) and r["kind"] == "blocked"
+
+
+def apply_sticky_block(con, task_id, kstatus, now):
+    """Keep the event trail in step with the mirrored status.
+
+    A row set to ``blocked`` by direct SQL has NO ``blocked`` event, and
+    ``kanban_db.recompute_ready()`` (gateway dispatcher, every tick) promotes exactly
+    those rows back to ``ready`` (``_has_sticky_block`` docstring: "as does a task with
+    no such event at all (direct DB edit)"). That ping-ponged every mirror-blocked item
+    back to ``ready`` within one dispatch tick (108x ready->blocked in kanban-sync.log,
+    2171 ``promoted`` events, zero ``blocked`` events ever). Emit the same event shape
+    ``kanban_block`` does so the mirror's blocked state survives the sweep.
+    """
+    sticky = _has_sticky_block(con, task_id)
+    if kstatus == "blocked" and not sticky:
+        _event(con, task_id, "blocked", now, '{"source":"backlog-mirror"}')
+        return "blocked-event"
+    if kstatus != "blocked" and sticky:
+        _event(con, task_id, "unblocked", now, '{"source":"backlog-mirror"}')
+        return "unblocked-event"
+    return ""
+
+
+def main():
+    # single writer: PA/other agents must run THIS script, not their own insert loop
+    lockfd = os.open(LOCK, os.O_CREAT | os.O_RDWR, 0o664)
+    try:
+        fcntl.flock(lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("BLOCKED: another backlog->kanban sync holds %s" % LOCK)
+        return 2
+    items = parse_backlog()
+    con = sqlite3.connect(DB, timeout=30)
+    con.row_factory = sqlite3.Row
+    now = int(time.time())
+    created = updated = reaped = 0
+    report = []
+    canonical_ids = set()
+    for it in items:
+        if not it["status"]:
+            continue
+        key = "backlog:" + it["id"]
+        kstatus = STATUS_MAP.get(it["status"], "ready")
+        assignee = it["claimed_by"] or OWNER.get(it["id"], "")
+        body = "BL-id: %s\nbacklog-status: %s\nblocker: %s\nsource: %s" % (
+            it["id"], it["status"], it["blocker"] or "-", BACKLOG)
+        row = con.execute("select id,status,assignee from tasks where idempotency_key=?",
+                          (key,)).fetchone()
+        if row is None:
+            tid = "t_" + hashlib.sha1(key.encode()).hexdigest()[:8]
+            con.execute(
+                "insert into tasks (id,title,body,assignee,status,priority,created_by,"
+                "created_at,workspace_kind,consecutive_failures,goal_mode,block_recurrences,"
+                "idempotency_key) values (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (tid, "%s %s" % (it["id"], it["title"]), body, assignee, kstatus, 0,
+                 "TelegramRunner", now, "scratch", 0, 0, 0, key))
+            # PA 2026-09-20: record the lifecycle stamps, else the board shows a `done`
+            # column full of rows with completed_at NULL and every "what finished?" probe
+            # returns 0 -- that is what made a 6/24-done backlog read as "nothing completes".
+            if kstatus == "done":
+                con.execute("update tasks set completed_at=? where id=?", (now, tid))
+            elif kstatus == "in_progress":
+                con.execute("update tasks set started_at=? where id=?", (now, tid))
+            apply_sticky_block(con, tid, kstatus, now)
+            created += 1
+            report.append("CREATED %s %s (%s) assignee=%s" % (it["id"], tid, kstatus, assignee or "-"))
+        else:
+            canonical_ids.add(row["id"])
+            prev = row["status"]
+            if row["status"] != kstatus or (row["assignee"] or "") != assignee:
+                sets = ["status=?", "assignee=?", "body=?"]
+                params = [kstatus, assignee, body]
+                if kstatus == "done" and prev != "done":
+                    sets.append("completed_at=?")
+                    params.append(now)
+                elif kstatus != "done" and prev == "done":
+                    sets.append("completed_at=NULL")
+                elif kstatus == "in_progress":
+                    sets.append("started_at=coalesce(started_at,?)")
+                    params.append(now)
+                con.execute("update tasks set %s where idempotency_key=?" % ",".join(sets),
+                            tuple(params) + (key,))
+                ev = apply_sticky_block(con, row["id"], kstatus, now)
+                updated += 1
+                report.append("SYNCED  %s %s %s->%s%s" % (
+                    it["id"], row["id"], row["status"], kstatus,
+                    " (+%s)" % ev if ev else ""))
+    # reap foreign-scheme duplicates of items we now own canonically
+    if canonical_ids:
+        q = ("select id,idempotency_key,title from tasks where ifnull(idempotency_key,'')<>'' "
+             "and title like 'BL-%'")
+        for r in con.execute(q).fetchall():
+            if r["id"] in canonical_ids:
+                continue
+            if FOREIGN_RE.match(r["idempotency_key"] or "") and not (r["idempotency_key"] or "").startswith("backlog:"):
+                con.execute("delete from tasks where id=?", (r["id"],))
+                reaped += 1
+                report.append("REAPED  %s %s" % (r["idempotency_key"], r["id"]))
+    con.commit()
+    print("\n".join(report) if report else "no changes")
+    print("--- summary: %d canonical items, %d created, %d synced, %d foreign dupes reaped ---"
+          % (len(items), created, updated, reaped))
+    print("--- board now ---")
+    for r in con.execute("select id,status,assignee,substr(title,1,52) t from tasks "
+                         "where idempotency_key is not null order by status,id"):
+        print("  %-4s %-11s %-18s %s" % (r["id"], r["status"], r["assignee"] or "-", r["t"]))
+    con.close()
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())

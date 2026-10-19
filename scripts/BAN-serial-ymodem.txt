@@ -1,0 +1,11 @@
+BANNED — 2026-09-24 (Nick order)
+
+Do NOT run any `loady` / `sz --ymodem` / ymodem transfer of a kernel, DTB, initrd or any
+multi-megabyte file over the board's serial line. Those transfers take 45-70 minutes, hold the
+serial port the whole time, and get killed by session restarts.
+
+Deploy path for card files is: stage on host -> scp to tab reader -> human swaps the card.
+Sub-250 KB DTBs over serial are acceptable ONLY with Nick's explicit go in the room.
+
+Never power-cycle the board more than once per verified need, and never in a loop.
+If the board needs a card swap: page Nick (tell-nick.py), then wait. Do not cycle while waiting.

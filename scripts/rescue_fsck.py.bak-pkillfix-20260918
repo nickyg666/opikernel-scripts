@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""rescue_fsck.py — vendor 6.6 fsck.mode=force boot via pico UART (byte-paced).
+Run as root: sudo python3 rescue_fsck.py
+Owns /dev/ttyACM0 exclusively; prints boot progress until silence."""
+import serial, time, subprocess, sys, os
+
+DEV = "/dev/ttyACM0"
+LOG = "/home/host/pvrgl-work/sercap_fsck.log"
+
+# Fixed literal command, no user input — safe despite shell usage.
+os.system("pkill -f 'cat /dev/ttyACM0' 2>/dev/null")
+time.sleep(1)
+
+ser = serial.Serial(DEV, 115200, timeout=0.3)
+time.sleep(0.3)
+ser.reset_input_buffer()
+
+def send(cmd, wait=1.2):
+    for ch in cmd:
+        ser.write(ch.encode())
+        time.sleep(0.02)
+    ser.write(b"\n")
+    time.sleep(wait)
+
+def drain(seconds):
+    buf = b""
+    end = time.time() + seconds
+    while time.time() < end:
+        d = ser.read(256)
+        if d:
+            buf += d
+            end = time.time() + seconds
+    return buf
+
+# Power cycle via smartplug.
+subprocess.run([sys.executable, "/home/host/smartplug.py", "reboot"],
+               capture_output=True)
+print("power cycled; catching U-Boot...")
+time.sleep(3)
+for _ in range(44):
+    ser.write(b"\n")
+    time.sleep(0.25)
+time.sleep(1)
+
+out = drain(4)
+print(out[-800:].decode(errors="replace"))
+
+cmds = [
+    "setenv bootargs 'root=/dev/mmcblk1p1 rootwait fsck.mode=force fsck.repair=yes console=ttyS0,115200 loglevel=7'",
+    "load mmc 0:1 41000000 boot/uImage",
+    "load mmc 0:1 43000000 boot/dtb-6.6.98-sun60iw2/allwinner/sun60i-a733-orangepi-zero3w.dtb",
+    "fdt addr 43000000",
+    "fdt resize 65536",
+    "bootm 41000000 - 43000000",
+]
+for c in cmds:
+    send(c)
+    out = drain(3)
+    print(out[-400:].decode(errors="replace"))
+
+print("=== waiting for fsck+boot ===")
+out = drain(60)
+print(out[-1500:].decode(errors="replace"))
+with open(LOG, "ab") as f:
+    f.write(out)
+ser.close()
+print("done")

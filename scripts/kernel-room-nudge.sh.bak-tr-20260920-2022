@@ -1,0 +1,186 @@
+#!/bin/bash
+# kernel-room-nudge.sh — continuous whip for the KernelDev-GPU room.
+#
+# WHY THIS EXISTS (2026-09-19):
+#   scripts/group-orchestrator.sh:100-101 gates its nudge call on
+#       if [ "$room" = "mti3yr2g3yjpyr" ]   # Neorunner ONLY
+#   so the kernel room (mti5ax1clq0zlx) got NO nudge on any tick.
+#
+# 2026-09-19 UPDATE (why the room still went quiet / "not triggering properly"):
+#   1. Cooldown was 900s with MAX_PER_TICK=3 -> one burst, then 15 min of silence
+#      while the queue kept piling up. Now: 240s cooldown, all stale agents per tick.
+#   2. Staleness came ONLY from gc_execution_queue rows, which never drain for
+#      agents whose worker session is not connected ("Agent X is not connected").
+#      Those rows made every agent look stale forever AND nudged agents who had
+#      just answered. Now the primary signal is the agent's LAST ROOM MESSAGE
+#      (same signal group_orchestrator_detect.py uses); the queue only fills in
+#      for agents that have never spoken.
+#
+# Cooldown state is shared with the Neorunner nudge: state/nudge-state.json,
+# keyed "<room>|<agent>". Per-agent mentions only — Nick's rule: no @all blasts.
+set -euo pipefail
+
+ROOM="${ROOM_ID:-mti5ax1clq0zlx}"
+DB_GC="${DB_GC:-/home/host/.hermes-web-ui/hermes-web-ui.db}"
+STATE_DIR="${STATE_DIR:-/home/host/opikernel/state}"
+STATE_FILE="$STATE_DIR/nudge-state.json"
+NUDGE_INTERVAL="${NUDGE_INTERVAL:-240}"   # >=4 min between nudges of the SAME agent
+IDLE_MIN="${IDLE_MIN:-6}"                 # silent longer than this == stale
+MAX_PER_TICK="${MAX_PER_TICK:-9}"         # one nudge per stale agent, never @all
+GHOSTS="${GHOSTS:-default,project analyzer}"  # non-agent rows in gc_room_agents
+
+# Circuit breaker (2026-09-20): a lane whose every queued mention is REAPED and which
+# completes NOTHING is dead, not idle — the room's (room,agent) drain key is stuck.
+# Whip traffic into it is pure amplification (build-engineer + powervr-monkey: 238 queued
+# rows and 0 completions for 11 h) and it makes the digest read a broken drain as laziness.
+# Dead lanes are quarantined, and escalated ONCE per ESCALATE_INTERVAL instead of re-mentioned.
+DEAD_WINDOW_MIN="${DEAD_WINDOW_MIN:-180}"
+DEAD_REAPS="${DEAD_REAPS:-4}"
+ESCALATE_INTERVAL="${ESCALATE_INTERVAL:-3600}"
+DRY_RUN="${DRY_RUN:-0}"
+GROSS_PILE="${GROSS_PILE:-40}"            # also quarantine on sheer undrained backlog
+
+mkdir -p "$STATE_DIR"
+[ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
+
+# Candidate selection: real room activity first, queue lag as fallback.
+STALE=$(GHOST_LIST="$GHOSTS" python3 - "$ROOM" "$IDLE_MIN" <<'PY'
+import sqlite3, sys, time, os
+room, idle_min = sys.argv[1], float(sys.argv[2])
+ghosts = {g.strip() for g in os.environ.get("GHOST_LIST", "").split(",") if g.strip()}
+now_ms = time.time() * 1000
+con = sqlite3.connect("/home/host/.hermes-web-ui/hermes-web-ui.db")
+con.row_factory = sqlite3.Row
+agents = con.execute("SELECT agentId, name FROM gc_room_agents WHERE roomId=?", (room,)).fetchall()
+out = []
+for a in agents:
+    if a["name"] in ghosts:
+        continue
+    m = con.execute("""SELECT timestamp FROM gc_messages
+                       WHERE roomId=? AND senderName=? ORDER BY timestamp DESC LIMIT 1""",
+                    (room, a["name"])).fetchone()
+    msg_age = (now_ms - m["timestamp"]) / 60000.0 if (m and m["timestamp"]) else None
+    q = con.execute("""SELECT createdAt, finishedAt, status FROM gc_execution_queue
+                       WHERE roomId=? AND targetAgentId=? AND status<>'pending'
+                       ORDER BY createdAt DESC LIMIT 1""", (room, a["agentId"])).fetchone()
+    q_ts = (q["finishedAt"] or q["createdAt"]) if q else None
+    q_age = (now_ms - q_ts) / 60000.0 if q_ts else 9999.0
+    age = msg_age if msg_age is not None else q_age
+    if age > idle_min:
+        stamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime((now_ms - age * 60000) / 1000))
+        out.append((age, a["name"], stamp))
+for age, name, stamp in sorted(out, key=lambda x: -x[0]):
+    print(f"{name}\t{stamp}\t{age:.1f}min silent")
+PY
+)
+
+[ -z "$STALE" ] && { echo "[$(date -Is)] kernel-nudge: no stale agents"; exit 0; }
+
+NOW=$(date +%s)
+LAST=$(cat "$STATE_FILE")
+NEW="$LAST"
+count=0
+qcount=0
+
+# --- circuit breaker: classify dead lanes BEFORE mentioning anyone -------------
+QUARANTINE=$(ROOM_ID="$ROOM" WIN="$DEAD_WINDOW_MIN" MINREAP="$DEAD_REAPS" PILE="$GROSS_PILE" \
+  DB_GC="$DB_GC" python3 <<'PY'
+import os, sqlite3, time
+room = os.environ["ROOM_ID"]; win = int(os.environ["WIN"])
+minreap = int(os.environ["MINREAP"]); pile = int(os.environ["PILE"])
+now_ms = time.time() * 1000
+con = sqlite3.connect(os.environ.get("DB_GC", "/home/host/.hermes-web-ui/hermes-web-ui.db"))
+for name, done, reaped, queued, total, first in con.execute("""
+        SELECT targetAgentName,
+               sum(status='completed')                                   AS done,
+               sum(lastError LIKE '%reaped%')                            AS reaped,
+               sum(status='queued')                                      AS queued,
+               count(*)                                                  AS total,
+               min(createdAt)                                            AS first_ms
+          FROM gc_execution_queue
+         WHERE roomId=? AND createdAt>?
+      GROUP BY targetAgentName""", (room, now_ms - win * 60000)):
+    if not name:
+        continue
+    if done == 0 and reaped >= minreap:
+        why = "%d reaped / %d rows, 0 completed since %s" % (
+            reaped, total, time.strftime('%H:%M', time.localtime(first / 1000)))
+        print("%s\t%s" % (name, why))
+    elif queued >= pile:
+        print("%s\t%d mentions undrained (queued, no completions)" % (name, queued))
+PY
+)
+
+if [ -n "$QUARANTINE" ]; then
+  while IFS=$'\t' read -r QAGENT QWHY; do
+    [ -z "$QAGENT" ] && continue
+    qcount=$((qcount + 1))
+    QOK=$(python3 -c "
+import json
+try: d=json.loads('''$LAST''')
+except Exception: d={}
+print('1' if ($NOW - float(d.get('$ROOM|$QAGENT|escalated',0))) > $ESCALATE_INTERVAL else '0')
+" 2>/dev/null || echo 1)
+    if [ "$QOK" = "0" ]; then
+      echo "[$(date -Is)] quarantine held (escalation already sent): $QAGENT"
+      continue
+    fi
+    echo "[$(date -Is)] QUARANTINE $QAGENT — $QWHY"
+    if [ "$DRY_RUN" = "1" ]; then
+      echo "  DRY_RUN: would post one BLOCKER line for $QAGENT"
+    else
+      gc-post --room "$ROOM" --as TelegramRunner \
+        "BLOCKER (dispatch, auto): lane $QAGENT is dead, not idle — $QWHY. Its whip traffic is now quarantined. Reviving it needs a drain-guard reset (clear-context) in a quiet window; another mention cannot help." \
+        >/dev/null 2>&1 || echo "  escalation FAILED for $QAGENT"
+      NEW=$(python3 -c "
+import json
+try: d=json.loads('''$LAST''')
+except Exception: d={}
+d['$ROOM|$QAGENT|escalated']='$NOW'
+print(json.dumps(d))")
+      LAST="$NEW"
+    fi
+  done <<< "$QUARANTINE"
+fi
+
+while IFS=$'\t' read -r AGENT T AGE; do
+  [ -z "$AGENT" ] && continue
+  [ "$count" -ge "$MAX_PER_TICK" ] && break
+  if printf '%s\n' "$QUARANTINE" | cut -f1 | grep -qxF "$AGENT"; then
+    echo "  skip (quarantined dead lane): $AGENT"
+    continue
+  fi
+  KEY="$ROOM|$AGENT"
+  COOLDOWN_OK=$(python3 -c "
+import json
+try: d=json.loads('''$LAST''')
+except Exception: d={}
+print('1' if ($NOW - float(d.get('$KEY',0))) > $NUDGE_INTERVAL else '0')
+" 2>/dev/null || echo 1)
+  [ "$COOLDOWN_OK" = "0" ] && { echo "cooldown active: $AGENT"; continue; }
+
+  echo "[$(date -Is)] nudging $AGENT ($AGE)"
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "  DRY_RUN: would nudge $AGENT"
+  else
+    gc-post --room "$ROOM" --as TelegramRunner --mention "$AGENT" \
+      "@$AGENT — last room output was $T ($AGE). Do ONE bounded action for your role now (single command, real output) and post <=5 lines of hard evidence, or a one-line blocker. Do not wait on anyone." \
+      >/dev/null 2>&1 || echo "  gc-post FAILED for $AGENT"
+  fi
+
+  NEW=$(python3 -c "
+import json
+try: d=json.loads('''$LAST''')
+except Exception: d={}
+d['$KEY']='$NOW'
+print(json.dumps(d))")
+  LAST="$NEW"
+  count=$((count+1))
+done <<< "$STALE"
+
+if [ "$DRY_RUN" = "1" ]; then
+  echo "[$(date -Is)] kernel-nudge DRY_RUN (nudged=$count quarantined=$qcount) — state not written"
+  exit 0
+fi
+echo "$NEW" > "$STATE_FILE"
+echo "[$(date -Is)] kernel-nudge done (nudged=$count quarantined=$qcount)"

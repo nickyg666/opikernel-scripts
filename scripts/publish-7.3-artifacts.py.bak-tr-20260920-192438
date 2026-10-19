@@ -1,0 +1,635 @@
+#!/usr/bin/env python3
+"""
+publish-7.3-artifacts.py — publish every GATE-PASSED opiz3w 7.3 kernel build to
+GitHub: nickyg666/orangepi-zero3w-7.3-artifacts
+
+Why: the host (.168) is the only place 7.3 artifacts exist; a card/disk loss
+destroys them. Every successful build must land in the repo, with a SHA256
+manifest and the boot evidence that made it "successful".
+
+Success gate (ALL must hold, else the build is REJECTED and logged, not published):
+  1. Image exists, magic bytes 1f2003d5, size sane (< 64 MiB)
+  2. embedded ikconfig: CONFIG_ARM64_VA_BITS=39  (52 breaks vendor BL31 on A76/A55)
+  3. embedded ikconfig: CONFIG_EFI_STUB is absent or =n  (U-Boot 2018 booti)
+  4. Image is quiescent: no `make` running and mtime older than --min-age seconds
+  5. Image md5 not already published (dedupe)
+
+Publishes, per build: builds/<UTCstamp>-<md5[:8]>/{Image.xz,dtb,boot.scr,
+config.gz,modules*.tar.gz,BUILD.json,SHA256SUMS}. Token is read from an existing
+nickyg666 remote and is NEVER printed.
+
+Usage:
+  publish-7.3-artifacts.py --if-new          # cron default: publish only if new
+  publish-7.3-artifacts.py --force --label x # republish labelled dir
+  publish-7.3-artifacts.py --dry-run
+"""
+import argparse, glob, hashlib, json, os, re, shutil, subprocess, sys, time, tarfile
+from datetime import datetime, timezone
+
+KDIR = "/home/host/kernel-trees/host-build/mainline-7.3"
+IMAGE = f"{KDIR}/arch/arm64/boot/Image"
+DTB = f"{KDIR}/arch/arm64/boot/dts/allwinner/sun60i-a733-orangepi-zero3w.dtb"
+STAGE = "/home/host/opikernel/stage/7.3-stage"
+KOVER = f"{KDIR}/drivers/gpu/drm/imagination/powervr.ko"
+# kbuild's INSTALL_MOD_STRIP=1 invokes "$(CROSS_COMPILE)strip --strip-debug" on every module it
+# installs, so a deploy bundle NEVER carries the raw tree .ko — comparing raw md5 only would
+# reject a perfectly fresh bundle (this bit us: the small bundle's powervr.ko was byte-identical
+# in every loadable section to the tree's, and differed from it only in 20 bytes of reloc/symtab
+# metadata). Accept either form.
+STRIP = "aarch64-linux-gnu-strip"
+REPO_DIR = "/home/host/opikernel-7.3-artifacts"
+WORK = "/home/host/opikernel/stage/7.3-artifacts-publish"
+REMOTE = "github.com/nickyg666/orangepi-zero3w-7.3-artifacts.git"
+LOG = "/home/host/opikernel/logs/publish-7.3-artifacts.log"
+REJECT_LOG = "/home/host/opikernel/logs/publish-7.3-artifacts-rejected.log"
+STATE = f"{WORK}/.last-published.json"
+
+README_TXT = """# orangepi-zero3w-7.3-artifacts
+
+Gate-passed build artifacts for the **Orange Pi Zero 3W (Allwinner A733 / `sun60iw2`)**
+kernel **7.3** bring-up. Source of truth for the build is host `.168`
+(`/home/host/kernel-trees/host-build/mainline-7.3`), which is the only machine that
+compiles this kernel.
+
+Every successful build is published automatically by
+`opikernel/scripts/publish-7.3-artifacts.py` (cron, `--if-new`). Nothing is published
+unless it passes the gate below.
+
+## Layout
+
+```
+LATEST                     <- name of the newest published build dir
+PUBLISH-LOG.md             <- append-only history, one line per build
+builds/<UTCstamp>-<md5[:8]>/Image.xz                     kernel Image, xz-compressed
+                            sun60i-a733-orangepi-zero3w.dtb
+                            boot.scr / boot.cmd           canonical boot script copies
+                            config-7.3-<md5[:8]>.gz       full .config, gzip
+                            modules-*.tar.gz              module bundle (vermagic-matched)
+                            BUILD.json                    md5/sha256/magic/ikconfig evidence
+                            SHA256SUMS                    hashes of every payload file
+```
+
+## Publish gate (all must hold)
+
+1. `Image` magic is `1f2003d5` (raw arm64 Image, `booti`-compatible) and < 64 MiB
+   (a larger Image at `0x41000000` overlaps the DTB window at `0x43000000`).
+2. Embedded ikconfig has `CONFIG_ARM64_VA_BITS=39` — 52-bit is fatal on this SoC
+   (Cortex-A76/A55 v8.2 lacks FEAT_LVA, vendor BL31/ATF panics invisibly).
+3. `CONFIG_EFI_STUB` absent or `=n` — the vendor U-Boot 2018 `booti` path.
+4. No `make` running and the Image has been quiescent for >= 90 s.
+5. Image md5 not already in `builds/` (dedupe).
+
+Rejections are logged to `opikernel/logs/publish-7.3-artifacts-rejected.log`, never pushed.
+
+## Boot constraints baked into every artifact (32-bit U-Boot 2018)
+
+- HARD ceiling `0x43999999`; kernel `0x41000000` (copy-down `0x40200000`), DTB `0x43000000`.
+- `cp.b` / `ext4write` / `crc32` size arguments are parsed as **HEX**.
+- `fdt resize 65536` before `booti`; `rootwait`; `modprobe.blacklist=aic8800_btlpm`.
+
+`BUILD.json.publisher.boot_cmd` carries the exact U-Boot command line for that build.
+"""
+
+
+
+def log(msg, path=LOG):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    line = f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] {msg}"
+    print(line, flush=True)
+    with open(path, "a") as f:
+        f.write(line + "\n")
+
+
+def token():
+    for d in sorted(glob.glob("/home/host/*/.git") + glob.glob("/home/host/*/*/.git")):
+        try:
+            t = open(os.path.join(d, "config")).read()
+        except Exception:
+            continue
+        m = re.search(r"https://([^@/]+)@github\.com", t)
+        if m and ":" in m.group(1):
+            return m.group(1).split(":", 1)[1]
+    raise SystemExit("no github token found in any remote")
+
+
+def scrub(s, tk):
+    return str(s).replace(tk, "***")
+
+
+def sh(cmd, tk=None, cwd=None, check=False):
+    p = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True,
+                       cwd=cwd, timeout=1800)
+    out = (p.stdout or "") + (p.stderr or "")
+    if tk:
+        out = scrub(out, tk)
+    if check and p.returncode != 0:
+        raise SystemExit(f"cmd failed rc={p.returncode}: {scrub(str(cmd), tk or '')}\n{out[:2000]}")
+    return p.returncode, out
+
+
+def md5(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def size(p):
+    return os.path.getsize(p) if os.path.exists(p) else None
+
+
+def magic(p, n=4):
+    with open(p, "rb") as f:
+        return f.read(n).hex()
+
+
+def ikconfig(image):
+    """Return embedded config as dict via scripts/extract-ikconfig."""
+    ex = f"{KDIR}/scripts/extract-ikconfig"
+    if not os.path.exists(ex):
+        return {}
+    rc, out = sh(f"bash {ex} {image}")
+    cfg = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("CONFIG_") and "=" in line:
+            k, v = line.split("=", 1)
+            cfg[k] = v
+    return cfg
+
+
+def module_bundle_facts():
+    """The module bundles are hand-built into STAGE/deploy-va39 while the Image is relinked by
+    every build, so the publisher could ship today's kernel next to a days-old powervr.ko and
+    nothing in BUILD.json said so (it only carried the tarball's size/sha256). Compare the
+    bundle's powervr.ko against the object THIS build produced and let the gate reject a
+    mixed set instead of publishing it silently."""
+    raw = md5(KOVER) if os.path.exists(KOVER) else None
+    stripped = None
+    if raw:
+        tmp = f"{WORK}/.pv-ref-{os.getpid()}.ko"
+        rc, _ = sh(f"{STRIP} --strip-debug -o {tmp} {KOVER}")
+        if rc == 0 and os.path.exists(tmp):
+            stripped = md5(tmp)
+            os.unlink(tmp)
+    out: dict = {"kdire_powervr_md5": raw, "kdire_powervr_md5_stripped": stripped}
+    accepted = [h for h in (raw, stripped) if h]
+    for base in ("modules-small-va39.tar.gz", "modules-va39.tar.gz"):
+        p = f"{STAGE}/deploy-va39/{base}"
+        if not os.path.exists(p):
+            continue
+        rc, got = sh(f"tar xzOf {p} --wildcards '*powervr.ko' 2>/dev/null | md5sum | cut -d' ' -f1")
+        got = (got.strip().splitlines() or [""])[-1].strip()
+        out[base] = {
+            "path": p, "size": size(p), "md5": md5(p),
+            "mtime": datetime.fromtimestamp(os.path.getmtime(p), timezone.utc).isoformat(timespec="seconds"),
+            "powervr_ko_md5": got,
+            "powervr_ko_form": ("raw" if got == raw else "stripped" if got == stripped else "unknown"),
+            "powervr_ko_match": bool(got and accepted and got in accepted),
+        }
+    return out
+
+
+def gate(force=False, min_age=90):
+    """Return (ok, reason, facts)."""
+    facts: dict = {}
+    if not os.path.exists(IMAGE):
+        facts["image"] = {"path": IMAGE}
+        return False, "no Image", facts
+    facts["size"] = size(IMAGE)
+    facts["mtime"] = datetime.fromtimestamp(os.path.getmtime(IMAGE), timezone.utc).isoformat(timespec="seconds")
+    facts["md5"] = md5(IMAGE)
+    facts["magic"] = magic(IMAGE)
+    facts["image"] = {"path": IMAGE, "size": facts["size"], "md5": facts["md5"],
+                      "magic": facts["magic"], "mtime": facts["mtime"]}
+    if facts["magic"] != "1f2003d5":
+        return False, f"bad Image magic {facts['magic']}", facts
+    if facts["size"] > 64 << 20:
+        return False, f"Image too big ({facts['size']} B) — 0x41000000 overlaps DTB", facts
+    if not force:
+        rc, out = sh("pgrep -x make")
+        if rc == 0:
+            return False, "build in progress (pgrep -x make)", facts
+        if time.time() - os.path.getmtime(IMAGE) < min_age:
+            return False, f"Image written <{min_age}s ago — still settling", facts
+    cfg = ikconfig(IMAGE)
+    facts["config_lines"] = len(cfg)
+    if not cfg:
+        return False, "could not extract embedded ikconfig", facts
+    facts["va_bits"] = cfg.get("CONFIG_ARM64_VA_BITS")
+    facts["efi_stub"] = cfg.get("CONFIG_EFI_STUB", "(absent)")
+    if cfg.get("CONFIG_ARM64_VA_BITS") != "39":
+        return False, f"VA_BITS={cfg.get('CONFIG_ARM64_VA_BITS')} != 39 (BL31 A76/A55 requires 39)", facts
+    if cfg.get("CONFIG_EFI_STUB") == "y":
+        return False, "CONFIG_EFI_STUB=y — U-Boot 2018 booti incompatible", facts
+    facts["drm_powervr"] = cfg.get("CONFIG_DRM_POWERVR", "(absent)")
+    facts["arch_sunxi"] = cfg.get("CONFIG_ARCH_SUNXI", "(absent)")
+    facts["pinctrl_sun60iw2"] = cfg.get("CONFIG_PINCTRL_SUN60IW2", "(absent)")
+    mb = module_bundle_facts()
+    facts["module_bundles"] = mb
+    stale = [b for b, v in mb.items()
+             if isinstance(v, dict) and v.get("powervr_ko_md5") and not v["powervr_ko_match"]]
+    if stale and not force:
+        return False, ("stale module bundle: " + "; ".join(
+            f"{b} powervr.ko={mb[b]['powervr_ko_md5'][:8]} != build {str(mb['kdire_powervr_md5'])[:8]}"
+            for b in stale) +
+            f" — rebuild the bundles from {KDIR} into {STAGE}/deploy-va39 "
+            "(or --force to publish a mixed Image+modules set)"), facts
+    return True, "gate passed", facts
+
+
+def published_md5s():
+    """md5s that are ACTUALLY published — a build dir that exists on disk but was never
+    committed is NOT published. Three payload dirs (09-19 x2, 09-20) sat untracked with a
+    valid BUILD.json, so every tick logged 'already published' while GitHub main stayed at
+    the 09-18 build; the publish logs contain zero `push ` lines."""
+    seen = set()
+    for d in glob.glob(f"{REPO_DIR}/builds/*/"):
+        bj = os.path.join(d, "BUILD.json")
+        if not os.path.exists(bj):
+            continue
+        rel = os.path.relpath(d, REPO_DIR)
+        if not sh(f"git -C {REPO_DIR} ls-files -- {rel}")[1].strip():
+            continue
+        try:
+            seen.add(json.load(open(bj))["image"]["md5"])
+        except Exception:
+            pass
+    return seen
+
+
+def payload_size_ok():
+    st = os.statvfs("/home/host")
+    free = st.f_bavail * st.f_frsize
+    if free < 3 << 30:
+        return False, f"host free {free>>20} MiB < 3 GiB"
+    return True, "ok"
+
+
+def compress(src, dst):
+    if os.path.exists(dst) and os.path.getsize(dst) > 0:
+        return dst
+    rc, out = sh(f"xz -6 -T0 -f -k {src} && mv -f {src}.xz {dst}")
+    if rc != 0 or not os.path.exists(dst):
+        # fall back to zstd
+        rc, out = sh(f"zstd -19 -T0 -f -o {dst} {src}")
+        if rc != 0:
+            raise SystemExit(f"compression failed: {out[:400]}")
+    return dst
+
+
+def build_payload(force=False, label=""):
+    ok, reason, facts = gate(force=force)
+    if not ok:
+        log(f"REJECTED: {reason} | md5={facts.get('md5','?')[:12]}", REJECT_LOG)
+        return None, reason, facts
+    vs, why = payload_size_ok()
+    if not vs:
+        return None, why, facts
+
+    img_md5 = facts["md5"]
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    name = f"{stamp}-{img_md5[:8]}" + (f"-{label}" if label else "")
+    tmp = os.path.join(REPO_DIR, "builds", name)
+    os.makedirs(tmp, exist_ok=True)
+    out = tmp
+
+    # Image
+    img_dst = os.path.join(tmp, "Image.xz")
+    compress(IMAGE, img_dst)
+
+    # DTB
+    dtb_info = {}
+    if os.path.exists(DTB):
+        shutil.copy2(DTB, os.path.join(tmp, "sun60i-a733-orangepi-zero3w.dtb"))
+        dtb_info = {"path": "sun60i-a733-orangepi-zero3w.dtb", "size": size(DTB),
+                    "md5": md5(DTB), "magic": magic(DTB),
+                    "source": DTB, "mtime": datetime.fromtimestamp(os.path.getmtime(DTB), timezone.utc).isoformat(timespec="seconds")}
+        facts["dtb"] = dtb_info
+
+    # boot.scr (canonical staged copy). A zero-byte candidate is a truncated/crashed
+    # write (STAGE/boot.scr went 97990cc09a6d -> 0 B on 09-19 22:47 and every payload
+    # staged after that shipped an empty boot.scr) — never publish one, fall through.
+    scr = {}
+    for cand in [f"{STAGE}/boot.scr", f"{STAGE}/boot.scr.card-20260918-verified", f"{STAGE}/boot.cmd"]:
+        if os.path.exists(cand) and size(cand) > 0:
+            base = os.path.basename(cand)
+            shutil.copy2(cand, os.path.join(tmp, base))
+            scr[base] = {"size": size(cand), "md5": md5(cand), "magic": magic(cand, 4)}
+    facts["boot"] = scr
+
+    # embedded config straight out of the Image — AUTHORITATIVE. The tree's .config is
+    # written by whoever last ran olddefconfig and is captured mid-write often enough
+    # to matter (a 4845-line snapshot was published once while a sibling agent was
+    # regenerating a 11918-line config).
+    emb = os.path.join(tmp, "config-embedded-image.gz")
+    rc, out = sh(f"bash {KDIR}/scripts/extract-ikconfig {IMAGE} > /tmp/.ikc.pub 2>/dev/null; "
+                 f"gzip -9 -c /tmp/.ikc.pub > {emb}; wc -l < /tmp/.ikc.pub")
+    emb_info = {}
+    if os.path.exists(emb) and os.path.getsize(emb) > 0:
+        emb_info = {"file": os.path.basename(emb), "sha256": sha256(emb),
+                    "lines": int(out.strip() or 0), "source": "scripts/extract-ikconfig <Image>"}
+    facts["config_embedded"] = emb_info
+
+    # kernel config (live tree copy — may be mid-edit, kept for diffing)
+    kcfg = f"{KDIR}/.config"
+    cfg_info = {}
+    if os.path.exists(kcfg):
+        c_dst = os.path.join(tmp, f"config-7.3-tree-{md5(kcfg)[:8]}.gz")
+        sh(f"gzip -9 -c {kcfg} > {c_dst}")
+        cfg_info = {"file": os.path.basename(c_dst), "md5": md5(kcfg), "size": size(kcfg),
+                    "lines": sum(1 for _ in open(kcfg, errors="ignore")),
+                    "note": "live KDIR/.config at publish time; NOT necessarily the Image's config"}
+    facts["config_file"] = cfg_info
+
+    # modules bundle + vermagic
+    mods = {}
+    for cand in [f"{STAGE}/deploy-va39/modules-small-va39.tar.gz", f"{STAGE}/deploy-va39/modules-va39.tar.gz"]:
+        if os.path.exists(cand):
+            base = os.path.basename(cand)
+            shutil.copy2(cand, os.path.join(tmp, base))
+            mods[base] = {"size": size(cand), "sha256": sha256(cand)}
+    for ko in glob.glob(f"{STAGE}/deploy-va39/modules/*.ko")[:1] + glob.glob(f"{KDIR}/drivers/gpu/drm/imagination/powervr.ko")[:1]:
+        rc, out = sh(f"modinfo -F vermagic {ko} 2>/dev/null")
+        if out.strip():
+            mods.setdefault("vermagic", {})[os.path.basename(ko)] = out.strip()
+    facts["modules"] = mods
+
+    # AIC8800 SDIO WiFi firmware — the .ko loads <fw_path>/aic8800D80/<name> with
+    # aic_default_fw_path=/lib/firmware (aicbluetooth.c:325). Publishing the modules
+    # WITHOUT this leaves modprobe failing -ENOENT on a booting kernel.
+    aic_fw = f"{STAGE}/aic8800-fw.tar.gz"
+    if os.path.exists(aic_fw):
+        shutil.copy2(aic_fw, os.path.join(tmp, "aic8800-fw.tar.gz"))
+        rc, out = sh(f"tar tzf {aic_fw} | wc -l")
+        facts["aic_firmware"] = {
+            "file": "aic8800-fw.tar.gz", "size": size(aic_fw), "sha256": sha256(aic_fw),
+            "entries": int(out.strip() or 0), "extract_at": "/",
+            "install_path": "/lib/firmware/aic8800D80/",
+            "source": f"{STAGE}/aic8800-fw.tar.gz"}
+    else:
+        facts["aic_firmware"] = {"warning": f"{aic_fw} missing — WiFi fw not bundled"}
+
+    # host build evidence
+    ev = {}
+    for st in glob.glob("/tmp/kdir-builds/*.state"):
+        try:
+            ev[os.path.basename(st)] = open(st).read().strip().splitlines()[-1]
+        except Exception:
+            pass
+    state_tail = ev.get("Image-dtbs.state", "")
+    facts["build_state"] = state_tail
+    facts["kdir_build_states"] = ev
+    facts["build_state_note"] = ("build_state is the tail of /tmp/kdir-builds/Image-dtbs.state "
+                                 "as of publish time; it is not proof that THIS Image came from "
+                                 "that run — use image.md5 + image.mtime as the identity")
+
+    facts["publisher"] = {"tool": "scripts/publish-7.3-artifacts.py",
+                          "published_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                          "gate": "magic+VA_BITS=39+EFI_STUB!=y+quiescent+dedupe",
+                          "kdire": KDIR,
+                          "boot_cmd": ("setenv bootargs root=PARTUUID=486ea4ae-01 rootfstype=ext4 rootwait rw "
+                                       "earlycon=uart,mmio32,0x2500000 console=ttyS0,115200 "
+                                       "modprobe.blacklist=aic8800_btlpm loglevel=7; ext4load mmc 0:1 0x41000000 "
+                                       "boot/mainline/Image; cp.b 0x41000000 0x40200000 <HEX size>; "
+                                       "ext4load mmc 0:1 0x43000000 boot/mainline/sun60i-a733-orangepi-zero3w.dtb; "
+                                       "fdt addr 0x43000000; fdt resize 65536; booti 0x40200000 - 0x43000000")}
+    facts["label"] = label
+    facts["repo"] = f"https://github.com/nickyg666/orangepi-zero3w-7.3-artifacts/tree/main/builds/{name}"
+
+    # SHA256SUMS over payload files (BUILD.json is excluded: it embeds this list,
+    # so hashing it would self-reference and always mismatch on re-check)
+    facts["SHA256SUMS"] = []
+    with open(os.path.join(tmp, "BUILD.json"), "w") as f:
+        json.dump(facts, f, indent=2, sort_keys=True)
+    lines = []
+    for p in sorted(glob.glob(os.path.join(tmp, "*"))):
+        if os.path.basename(p) in ("SHA256SUMS", "BUILD.json"):
+            continue
+        lines.append(f"{sha256(p)}  {os.path.basename(p)}")
+    with open(os.path.join(tmp, "SHA256SUMS"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    facts["SHA256SUMS"] = lines
+    with open(os.path.join(tmp, "BUILD.json"), "w") as f:
+        json.dump(facts, f, indent=2, sort_keys=True)
+
+    # NOTE: `out` is clobbered by the `rc, out = sh(...)` calls above (it holds the last
+    # command's stdout, e.g. "12\n") — the check must use tmp, or every publish aborts here
+    # with a bogus "stage incomplete" and the payload dir stays untracked/local forever.
+    staged = sorted(os.path.basename(p) for p in glob.glob(os.path.join(tmp, "*")))
+    missing = [f for f in ("Image.xz", "BUILD.json", "SHA256SUMS") if f not in staged]
+    if missing:
+        raise SystemExit(f"stage incomplete in {tmp}: missing {missing} (have {staged})")
+    log(f"staged {name}: {staged}")
+    return {"name": name, "dir": tmp, "facts": facts}, "staged", facts
+
+
+def git_publish(tk, name, facts):
+    os.makedirs(REPO_DIR, exist_ok=True)
+    url = f"https://nickyg666:{tk}@{REMOTE}"
+    if not os.path.exists(f"{REPO_DIR}/.git"):
+        sh(f"git init -q -b main {REPO_DIR}")
+        sh("git config user.email pa@opikernel.local", cwd=REPO_DIR)
+        sh("git config user.name 'PA (opiz3w artifacts)'", cwd=REPO_DIR)
+    with open(f"{REPO_DIR}/LATEST", "w") as f:
+        f.write(name + "\n")
+    readme = os.path.join(REPO_DIR, "README.md")
+    if not os.path.exists(readme):
+        with open(readme, "w") as f:
+            f.write(README_TXT)
+    with open(os.path.join(REPO_DIR, "builds", name, "BUILD.json")) as f:
+        bj = json.load(f)
+    with open(f"{REPO_DIR}/PUBLISH-LOG.md", "a") as f:
+        f.write(f"- `{name}`  Image md5 `{bj['image']['md5']}`  {bj['image']['size']} B  "
+                f"VA_BITS={bj.get('va_bits')} EFI_STUB={bj.get('efi_stub')}  "
+                f"build state: `{bj.get('build_state','')}`  ({bj['publisher']['published_utc']})\n")
+    sh("git add -A", cwd=REPO_DIR)
+    rc, out = sh("git -c user.email=pa@opikernel.local -c user.name='PA' commit -q -m "
+                 f"'7.3 build {name}: Image {bj['image']['md5'][:12]} ({bj['image']['size']} B) "
+                 f"VA_BITS={bj.get('va_bits')} EFI_STUB={bj.get('efi_stub')}'", cwd=REPO_DIR)
+    rc, out = sh(f"git push -q {url} HEAD:refs/heads/main", cwd=REPO_DIR)
+    if rc != 0:
+        return False, f"push rc={rc}: {out[:400]}"
+    local = sh("git rev-parse HEAD", cwd=REPO_DIR)[1].strip()
+    rc, remote = sh(f"git ls-remote {url} refs/heads/main", cwd=REPO_DIR)
+    remote_sha = remote.split()[0] if remote.strip() else "(none)"
+    facts["remote_sha"] = remote_sha
+    facts["local_sha"] = local
+    ok = local == remote_sha
+    return ok, f"local={local[:12]} remote={remote_sha[:12]} match={ok}"
+
+
+def verify_remote(tk, name, facts):
+    """Fetch the published BUILD.json back from the GitHub API — remote-side proof."""
+    import urllib.request
+    path = f"/repos/nickyg666/orangepi-zero3w-7.3-artifacts/contents/builds/{name}/BUILD.json?ref=main"
+    req = urllib.request.Request("https://api.github.com" + path,
+                                 headers={"Authorization": "token " + tk,
+                                          "Accept": "application/vnd.github+json",
+                                          "User-Agent": "pa"})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            j = json.load(r)
+        import base64
+        remote_bj = json.loads(base64.b64decode(j["content"]))
+        same = remote_bj["image"]["md5"] == facts["image"]["md5"]
+        return same, f"remote BUILD.json file={j['name']} size={j['size']} md5_match={same}"
+    except Exception as e:
+        return False, f"API verify failed: {scrub(str(e), tk)[:300]}"
+
+
+def amend_existing(tk, facts, extras):
+    """Image md5 already published: drop any missing STAGE extras into THAT build dir and
+    re-publish it. Idempotent — used so a bundle published before a file existed (e.g. the
+    AIC8800 firmware) gets completed instead of silently staying incomplete forever."""
+    d = None
+    for cand in glob.glob(f"{REPO_DIR}/builds/*/"):
+        bj = os.path.join(cand, "BUILD.json")
+        if os.path.exists(bj):
+            try:
+                if json.load(open(bj))["image"]["md5"] == facts["md5"]:
+                    d = cand.rstrip("/")
+                    break
+            except Exception:
+                pass
+    if not d:
+        return False, "md5 marked published but no build dir carries it", facts
+    name = os.path.basename(d)
+    added = []
+    bj = json.load(open(os.path.join(d, "BUILD.json")))
+    for src, dst_name, meta, meta_fields in extras:
+        dst = os.path.join(d, dst_name)
+        if not os.path.exists(src):
+            continue
+        need = (not os.path.exists(dst)) or size(dst) != size(src) or sha256(dst) != sha256(src)
+        if need:
+            shutil.copy2(src, dst)
+            added.append(dst_name)
+            bj[meta] = {"file": dst_name, "size": size(src), "sha256": sha256(src),
+                        "source": src, **meta_fields}
+        bj.setdefault(meta, {})
+    if not added:
+        return True, f"{name}: already complete, nothing to amend", bj
+    # SHA256SUMS covers every payload file except itself and BUILD.json (self-reference)
+    lines = [f"{sha256(p)}  {os.path.basename(p)}"
+             for p in sorted(glob.glob(os.path.join(d, "*")))
+             if os.path.basename(p) not in ("SHA256SUMS", "BUILD.json")]
+    with open(os.path.join(d, "SHA256SUMS"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    bj["SHA256SUMS"] = lines
+    bj["amended"] = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                     "added": added, "by": "scripts/publish-7.3-artifacts.py --amend-extras"}
+    with open(os.path.join(d, "BUILD.json"), "w") as f:
+        json.dump(bj, f, indent=2, sort_keys=True)
+    url = f"https://nickyg666:{tk}@{REMOTE}"
+    sh("git add -A", cwd=REPO_DIR)
+    sh("git -c user.email=pa@opikernel.local -c user.name='PA' commit -q -m "
+       f"'amend {name}: add {', '.join(added)}'", cwd=REPO_DIR)
+    rc, out = sh(f"git push -q {url} HEAD:refs/heads/main", cwd=REPO_DIR)
+    if rc != 0:
+        return False, f"push rc={rc}: {out[:300]}", bj
+    local = sh("git rev-parse HEAD", cwd=REPO_DIR)[1].strip()
+    rc, remote = sh(f"git ls-remote {url} refs/heads/main", cwd=REPO_DIR)
+    remote_sha = remote.split()[0] if remote.strip() else "(none)"
+    return local == remote_sha, f"amended {added} local={local[:12]} remote={remote_sha[:12]}", bj
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--if-new", action="store_true")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--label", default="")
+    ap.add_argument("--min-age", type=int, default=90)
+    ap.add_argument("--amend-extras", action="store_true",
+                    help="Image md5 already published: add missing STAGE extras (aic8800-fw.tar.gz) "
+                         "to that build dir and re-push")
+    ap.add_argument("--amend-modules", action="store_true",
+                    help="Image md5 already published: replace that build dir's modules-*.tar.gz with "
+                         "the current STAGE/deploy-va39 bundles so Image+modules ship as one set")
+    a = ap.parse_args()
+
+    os.makedirs(WORK, exist_ok=True)
+    os.makedirs(REPO_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    ok, reason, facts = gate(force=a.force, min_age=a.min_age)
+    if not ok:
+        if a.if_new and reason in ("build in progress (pgrep -x make)",):
+            log(f"skip: {reason}")
+            return 0
+        log(f"REJECTED: {reason} | md5={facts.get('md5','?')[:12]}", REJECT_LOG)
+        print(f"REJECTED: {reason}")
+        return 0
+    prev = published_md5s()
+    if facts["md5"] in prev:
+        if a.amend_extras:
+            ok2, msg2, bj2 = amend_existing(token(), facts,
+                                            [(f"{STAGE}/aic8800-fw.tar.gz", "aic8800-fw.tar.gz",
+                                              "aic_firmware",
+                                              {"extract_at": "/", "install_path": "/lib/firmware/aic8800D80/",
+                                               "note": "AIC8800 firmware blobs for the SDIO WiFi/BT part"})])
+            log(f"amend-extras: {msg2}")
+            print(f"AMEND {'OK' if ok2 else 'FAILED'}: {msg2}")
+            return 0 if ok2 else 1
+        if a.amend_modules:
+            # the Image is already published but its module bundles may predate it (the publisher
+            # copies STAGE/deploy-va39, which is hand-assembled). Replace them in THAT build dir so
+            # Image+modules stay one coherent set instead of opening a duplicate build dir.
+            mb = module_bundle_facts()
+            stale = [b for b, v in mb.items()
+                     if isinstance(v, dict) and v.get("powervr_ko_md5") and not v["powervr_ko_match"]]
+            if stale:
+                log(f"amend-modules REFUSED: stale bundle(s) {stale}", REJECT_LOG)
+                print(f"REFUSED: stale module bundle(s) {stale} — rebuild with "
+                      f"scripts/rebuild-7.3-module-bundles.sh first")
+                return 1
+            extras = []
+            for base in ("modules-small-va39.tar.gz", "modules-va39.tar.gz"):
+                extras.append((f"{STAGE}/deploy-va39/{base}", base, f"module_bundle_{base}",
+                               {"extract_at": "/" if base.startswith("modules-small") else "/",
+                                "powervr_ko_md5": mb.get(base, {}).get("powervr_ko_md5"),
+                                "powervr_ko_form": mb.get(base, {}).get("powervr_ko_form"),
+                                "kernel_release": f"7.3/{(mb.get(base) or {}).get('powervr_ko_md5','')[:8]}",
+                                "note": "built from the same tree as Image " + facts["md5"][:12]}))
+            ok2, msg2, bj2 = amend_existing(token(), facts, extras)
+            log(f"amend-modules: {msg2}")
+            print(f"AMEND-MODULES {'OK' if ok2 else 'FAILED'}: {msg2}")
+            return 0 if ok2 else 1
+        log(f"skip: Image md5 {facts['md5'][:12]} already published ({len(prev)} build(s) in repo)")
+        return 0
+    if a.dry_run:
+        print(f"DRY-RUN would publish Image md5={facts['md5']} size={facts['size']} va={facts['va_bits']} efi={facts['efi_stub']}")
+        return 0
+
+    tk = token()
+    res, msg, facts = build_payload(force=a.force, label=a.label)
+    if not res:
+        print(f"not published: {msg}")
+        return 0
+    name = res["name"]
+    ok, msg = git_publish(tk, name, facts)
+    log(f"push {name}: {msg}")
+    if not ok:
+        print(f"PUSH FAILED: {msg}")
+        return 1
+    vok, vmsg = verify_remote(tk, name, facts)
+    log(f"remote-verify {name}: {vmsg}")
+    with open(STATE, "w") as f:
+        json.dump({"name": name, "image_md5": facts["image"]["md5"],
+                   "remote_sha": facts.get("remote_sha"), "remote_verified": vok,
+                   "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}, f, indent=2)
+    print(f"PUBLISHED {name} | {msg} | {vmsg}")
+    return 0 if vok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

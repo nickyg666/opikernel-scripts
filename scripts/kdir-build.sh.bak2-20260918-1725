@@ -1,0 +1,145 @@
+#!/bin/bash
+# kdir-build v3 — THE single serialized build runner for KDIR mainline-7.3.
+# Direct `make` in the tree is BANNED (racing makes delete each other's .o/.cmd -> phantom failures).
+#
+# Usage:
+#   kdir-build.sh start <targets...>   launch detached (returns instantly); e.g. start Image dtbs
+#   kdir-build.sh status               state + tail of latest build
+#   kdir-build.sh wait                 block until finished, then print EXIT + artifacts
+#   kdir-build.sh kill                 abort the running build (controlled)
+# Lock: /tmp/kdir-7.3.build.lock (held by the builder for its whole life)
+# Logs: /tmp/kdir-build-<slug>.log  |  State: /tmp/kdir-builds/<slug>.{pid,state}
+# Exit: 0 ok | 75 BUILD_LOCKED | 64 usage
+set -u
+KDIR="${KDIR:-/home/host/kernel-trees/host-build/mainline-7.3}"
+CROSS="${CROSS_COMPILE:-aarch64-linux-gnu-}"
+JOBS="${JOBS:-$(nproc)}"
+LOCK=/tmp/kdir-7.3.build.lock
+STATE_DIR=/tmp/kdir-builds
+CONFIG="${CONFIG:-$KDIR/.config}"
+GOLD="${GOLD:-/tmp/gold.config}"
+SELF=$(readlink -f "$0")
+mkdir -p "$STATE_DIR"
+
+builder() { # $1=slug, rest=target words
+  local slug="$1"; shift
+  local LOG="/tmp/kdir-build-$slug.log"
+  local pidf="$STATE_DIR/$slug.pid" statef="$STATE_DIR/$slug.state"
+  exec 9>"$LOCK"
+  flock 9                       # blocking: serialize, don't fail, if something else holds it
+  exec 2>>"$LOG"                 # builder stderr -> log (was /dev/null: silent deaths)
+  echo $$ > /tmp/kdir-build.pgid
+  # Set our PGID to match our PID (since we're in setsid, PID == PGID)
+  set -m
+  # The make command will inherit our PGID
+  echo "PGID $$" >> /tmp/kdir-build-$slug.log
+  echo $$ > "$pidf"
+  echo "RUNNING $(date '+%F %T') pid=$$ jobs=$JOBS targets=$*" > "$statef"
+  trap 'r=$?; case "$(cat "$statef" 2>/dev/null)" in RUNNING*) echo "FAILED rc=$r line=$LINENO $(date "+%F %T")" > "$statef"; echo "=== builder aborted rc=$r line=$LINENO $(date "+%F %T") ===" >> "$LOG";; esac' EXIT
+  # Guard: ensure .config matches gold; if not, restore and run olddefconfig
+  if [ -f "$CONFIG" ]; then
+    CONFIG_MD5=$(md5sum "$CONFIG" | cut -d' ' -f1)
+    GOLD_MD5=$(md5sum "$GOLD" | cut -d' ' -f1)
+    if [ "$CONFIG_MD5" != "$GOLD_MD5" ]; then
+      echo "WARNING: .config does not match gold. Restoring from gold and running olddefconfig." >> "$LOG"
+      cp "$GOLD" "$CONFIG"
+      nice -n 10 make ARCH=arm64 CROSS_COMPILE="$CROSS" olddefconfig
+    fi
+  else
+    echo "WARNING: .config missing. Copying from gold." >> "$LOG"
+    cp "$GOLD" "$CONFIG"
+    nice -n 10 make ARCH=arm64 CROSS_COMPILE="$CROSS" olddefconfig
+  fi
+  {
+    echo "=== kdir-build v3 start $(date '+%F %T') targets='$*' jobs=$JOBS ==="
+    cd "$KDIR" || exit 1
+    rc=0; attempt=0; max_attempt="${KDIR_BUILD_RETRIES:-20}"
+    while :; do
+      nice -n 10 make ARCH=arm64 CROSS_COMPILE="$CROSS" -j"$JOBS" "$@"
+      rc=$?
+      if [ $rc -eq 137 ] && [ $attempt -lt $max_attempt ]; then
+        attempt=$((attempt+1))
+        echo "SIGKILLed (rc=137) attempt $attempt/$max_attempt — kbuild resumable, relaunching in 5s $(date '+%F %T')"
+        sleep 5; continue
+      fi
+      break
+    done
+    echo "EXIT=$rc"
+    if [ -f arch/arm64/boot/Image ]; then
+      ls -la arch/arm64/boot/Image; md5sum arch/arm64/boot/Image
+      head -c4 arch/arm64/boot/Image | od -An -tx1
+      SZ=$(stat -c %s arch/arm64/boot/Image)
+      printf 'end_addr=0x%x (ceiling 0x43999999)\n' $((0x41000000+SZ))
+    fi
+    echo "=== finished $(date '+%F %T') rc=$rc ==="
+  } >> "$LOG" 2>&1
+  echo "DONE rc=$rc $(date '+%F %T')" > "$statef"
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+  start)
+    shift
+    [ $# -ge 1 ] || { echo "usage: $0 start <targets...>"; exit 64; }
+    slug=$(echo "$*" | tr ' /' '--')
+    setsid bash "$SELF" --run "$slug" "$@" < /dev/null > /dev/null 2>&1 &
+    echo "launched detached: slug=$slug log=/tmp/kdir-build-$slug.log"
+    ;;
+  --run) # internal
+    slug="$2"; shift 2; builder "$slug" "$@"
+    ;;
+  kill)
+    for pidf in "$STATE_DIR"/*.pid; do
+      [ -e "$pidf" ] || continue
+      p=$(<"$pidf")
+      if [ -d /proc/$p ]; then echo "killing build tree pid=$p"; kill -9 -- -"$p" 2>/dev/null || kill -9 "$p" 2>/dev/null; fi
+    done
+    ;;
+  wait)
+    slug=$(ls -t "$STATE_DIR"/*.state 2>/dev/null | head -1)
+    [ -n "$slug" ] || { echo IDLE; exit 0; }
+    slug=$(basename "$slug" .state)
+    for i in $(seq 1 340); do
+      st=$(cat "$STATE_DIR/$slug.state" 2>/dev/null)
+      case "$st" in DONE*) break;; esac
+      sleep 5
+    done
+    echo "$slug: $(cat "$STATE_DIR/$slug.state")"
+    grep -E 'EXIT=|md5sum|end_addr|Image$|finished' "/tmp/kdir-build-$slug.log" | tail -8
+    ;;
+  status|*)
+    found=0
+    for statef in "$STATE_DIR"/*.state; do
+      [ -e "$statef" ] || continue
+      found=1
+      slug=$(basename "$statef" .state); st=$(<"$statef")
+      pidf="$STATE_DIR/$slug.pid"; alive=no
+      [ -f "$pidf" ] && [ -d "/proc/$(<$pidf)" ] && alive=yes
+      echo "$slug: $st (builder-alive=$alive) log=/tmp/kdir-build-$slug.log"
+    done
+    [ $found -eq 0 ] && echo "IDLE — no builds launched via $SELF yet"
+    latest=$(ls -t "$STATE_DIR"/*.state 2>/dev/null | head -1)
+    if [ -n "$latest" ]; then lslug=$(basename "$latest" .state); echo "--- tail /tmp/kdir-build-$lslug.log"; tail -12 "/tmp/kdir-build-$lslug.log" 2>/dev/null; fi
+    echo "--- direct-makes-in-tree (rogues, will corrupt):"
+    # builder() runs `set -m`, so the make tree gets its OWN PGID (== make's PID), not the
+    # recorded builder PID — PGID matching false-positives on healthy builds. Walk the
+    # ancestry instead: sanctioned iff some ancestor cmdline contains kdir-build.sh.
+    rogue=0
+    while read -r pid etime cmd; do
+      [ -n "${cmd:-}" ] || continue
+      p="$pid"; sanctioned=no
+      for _ in $(seq 1 8); do
+        [ -z "$p" ] && break
+        [ "$p" = 0 ] && break
+        [ "$p" = 1 ] && break
+        c=$(ps -o cmd= -p "$p" 2>/dev/null)
+        [ -z "$c" ] && break
+        case "$c" in *kdir-build.sh*) sanctioned=yes; break;; esac
+        p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+      done
+      [ "$sanctioned" = yes ] && continue
+      echo "ROGUE pid=$pid etime=$etime $cmd"; rogue=1
+    done < <(ps -eo pid=,etime=,cmd= | grep '[m]ake ARCH=arm64')
+    [ "$rogue" -eq 0 ] && echo none
+    ;;
+esac

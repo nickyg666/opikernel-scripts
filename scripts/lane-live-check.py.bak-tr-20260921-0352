@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""PA: ONE live-row predicate shared by every whip path (digest + nudge).
+
+Why (RCA 2026-09-20 23:35, room mti5ax1clq0zlx): both whip producers decide a lane is
+"stale" from its last ROOM MESSAGE age. A lane that is mid-run -- or whose mention is
+already sitting undrained in the queue -- still reads silent, so it is mentioned again
+every cooldown. Measured with the queue ledger, room-scoped:
+
+    powervr-monkey   1 running + 4 queued  (333s/269s/206s/15s)  -> 5 rows, 4 minted by the digest
+    backlog-worker1  1 running + 3 queued  (824s/716s/652s)
+    build-engineer   1 running + 2 queued  (2296s/2232s)
+
+`scripts/kernel-room-nudge.sh` got the dedupe gate at 23:20 (QUEUE_DEDUPE_MIN=10, inline
+SQL); the digest path in `scripts/group-orchestrator.sh` had NO such gate -- only
+`lane_wedged()` -- so it kept minting rows for lanes that were already running. That is
+the whole "queued grows while completed also grows" signature.
+
+Rule: a lane holding a running|queued row younger than the window is NOT idle and gets no
+new structured mention (text-only) until that row drains.
+
+Contract (mirrors scripts/lane-wedge-check.py, so both paths cannot drift):
+  stdout : one "name<TAB>age_s" per live lane, oldest first. Empty when none.
+  rc 0   : at least one live lane (or a healthy empty result: rc is 1 then)
+  rc 1   : predicate ran, no live lanes  -> safe to mention everyone
+  rc 2   : predicate BROKEN (DB unreadable) -> prints NOTHING. Callers must read rc=2 as
+           UNKNOWN and fall back to mentioning (the pre-fix behaviour). A broken predicate
+           must never be able to silence the whip silently -- that failure mode is what
+           starved four lanes on 2026-09-20 20:37.
+
+Usage: lane-live-check.py <roomId>   [--window-min N] [--names-only]
+Env:   DB_GC (default /home/host/.hermes-web-ui/hermes-web-ui.db)
+"""
+import os
+import sqlite3
+import sys
+import time
+
+DB = os.environ.get("DB_GC", "/home/host/.hermes-web-ui/hermes-web-ui.db")
+DEFAULT_WINDOW_MIN = int(os.environ.get("PA_LIVE_WINDOW_MIN", "10"))
+
+
+def main():
+    args = [a for a in sys.argv[1:]]
+    names_only = "--names-only" in args
+    args = [a for a in args if a != "--names-only"]
+    window_min = DEFAULT_WINDOW_MIN
+    if "--window-min" in args:
+        i = args.index("--window-min")
+        try:
+            window_min = int(args[i + 1])
+        except (IndexError, ValueError):
+            window_min = DEFAULT_WINDOW_MIN
+        del args[i:i + 2]
+    if not args:
+        sys.stderr.write("lane-live-check: need <roomId>\n")
+        return 2
+    room = args[0]
+    now_ms = time.time() * 1000
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % DB, uri=True)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """SELECT a.name AS name, MIN(q.createdAt) AS oldest
+                 FROM gc_execution_queue q
+                 JOIN gc_room_agents a
+                   ON a.agentId = q.targetAgentId AND a.roomId = q.roomId
+                WHERE q.roomId = ?
+                  AND q.status IN ('running','queued')
+                  AND q.createdAt > ?
+                  AND COALESCE(a.removedAt, 0) = 0
+             GROUP BY a.name
+             ORDER BY oldest ASC""",
+            (room, now_ms - window_min * 60000),
+        ).fetchall()
+        con.close()
+    except Exception as exc:  # UNKNOWN verdict, never "no live lanes"
+        sys.stderr.write("lane-live-check: %s\n" % exc)
+        return 2
+
+    for r in rows:
+        age = int((now_ms - r["oldest"]) / 1000)
+        print(r["name"] if names_only else "%s\t%d" % (r["name"], age))
+    return 0 if rows else 1
+
+
+sys.exit(main())

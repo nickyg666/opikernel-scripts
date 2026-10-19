@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the crontab health guard every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+# Deliberately a wall-clock timer, not a monotonic-after-run timer, so a host
+# that reboots or a crontab that dies still gets checked.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

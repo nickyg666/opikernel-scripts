@@ -1,0 +1,17 @@
+#!/bin/bash
+LOG=/home/host/pvrgl-work/sercap_test_dd.log
+DEV=/dev/ttyACM0
+sudo /home/host/opikernel/scripts/claim-serial-port.sh >/dev/null 2>&1
+sudo /home/host/opikernel/scripts/claim-serial-port.sh >/dev/null 2>&1
+sleep 1
+
+# Try dd reader
+sudo bash -c "exec dd if=$DEV bs=1 of=$LOG iflag=nonblock 2>/dev/null" </dev/null >/dev/null 2>&1 &
+DD_PID=$!
+echo "DD PID=$DD_PID"
+sleep 3
+echo "After 3s: $(stat -c%s $LOG 2>/dev/null) bytes"
+sleep 3
+echo "After 6s: $(stat -c%s $LOG 2>/dev/null) bytes"
+kill $DD_PID 2>/dev/null
+echo "Content: $(strings $LOG | head -5)"

@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""deploy_bootscr.py — Push our fixed boot.scr.nofix to SD via U-Boot ext4write.
+Usage: sudo python3 deploy_bootscr.py
+"""
+import serial, sys, time, os, subprocess, base64
+
+DEV = "/dev/ttyACM0"
+BAUD = 115200
+LOG = "/home/host/pvrgl-work/deploy_bootscr.log"
+FIXED = "/home/host/opikernel/stage/boot.scr.nofix"
+
+logf = open(LOG, 'wb', buffering=0)
+def log(msg):
+    ts = time.strftime('%H:%M:%S')
+    line = f"[{ts}] {msg}\n"
+    sys.stdout.write(line); sys.stdout.flush()
+    logf.write(line.encode('utf-8')); logf.flush()
+
+def drain(ser):
+    for _ in range(20):
+        if ser.in_waiting:
+            ser.read(ser.in_waiting)
+        time.sleep(0.1)
+
+def send_cmd(ser, cmd, wait=2.0):
+    ser.write(cmd.encode() + b'\r')
+    time.sleep(0.1)
+    out = b''
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if ser.in_waiting:
+            out += ser.read(ser.in_waiting)
+        time.sleep(0.05)
+    return out.decode('utf-8', errors='replace')
+
+def wait_for(ser, patterns, timeout=30):
+    start = time.time()
+    buf = b''
+    while time.time() - start < timeout:
+        if ser.in_waiting:
+            data = ser.read(ser.in_waiting)
+            buf += data
+            decoded = buf.decode('utf-8', errors='replace')
+            for p in patterns:
+                if p in decoded:
+                    return p, decoded
+        time.sleep(0.05)
+    return None, buf.decode('utf-8', errors='replace')
+
+log("Killing readers...")
+subprocess.run("sudo /home/host/opikernel/scripts/claim-serial-port.sh >/dev/null 2>&1", shell=True)
+time.sleep(2)
+
+log("Opening serial...")
+ser = serial.Serial(DEV, BAUD, timeout=1)
+ser.dtr = False; ser.rts = False
+time.sleep(0.5)
+drain(ser)
+
+log("Power cycle...")
+subprocess.run(["/usr/bin/python3","/home/host/opikernel/scripts/host/smartplug.py","off","--model","WLPP1CFH","D03F271583AE"], capture_output=True)
+time.sleep(5)
+subprocess.run(["/usr/bin/python3","/home/host/opikernel/scripts/host/smartplug.py","on","--model","WLPP1CFH","D03F271583AE"], capture_output=True)
+
+log("Waiting for U-Boot...")
+pat, _ = wait_for(ser, ['Hit any key', '=>'], timeout=30)
+if not pat:
+    log("FAILED: No prompt"); logf.close(); ser.close(); sys.exit(1)
+log(f"Found '{pat}' — break...")
+ser.break_condition = True; time.sleep(0.05); ser.break_condition = False
+time.sleep(0.3); ser.write(b'\r'); time.sleep(1.0)
+drain(ser); time.sleep(2)
+
+# Use base64 transfer to push the file via U-Boot console
+# This is slow but reliable for binary files
+with open(FIXED, 'rb') as f:
+    boot_data = f.read()
+size = len(boot_data)
+log(f"File size: {size} bytes")
+
+# Base64 encode and chunk for transfer
+b64 = base64.b64encode(boot_data).decode('ascii')
+log(f"Base64 size: {len(b64)} chars")
+CHUNK = 512  # chars per line
+
+# Write in chunks via printf commands
+# Use a simpler approach: split into small base64 strings, each gets decoded and appended
+# Or use a single block write via loadb-style approach
+
+# Easiest: write the whole base64 as one block, then base64 -d > /boot/boot.scr
+# This requires busybox on initrd or... we're in U-Boot, no base64 -d
+# Alternative: load file via ymodem
+
+# U-Boot supports 'loadb' for ymodem/xmodem upload. Let's use that.
+# First ensure serial is in raw mode
+log("Setting up ymodem upload...")
+
+# Set the load address
+resp = send_cmd(ser, "loadb 0x43200000 115200", 1)
+log(f"loadb response: {resp.strip()[:200]}")
+
+# We can't easily use ymodem from this script. 
+# Alternative: write the file to SD using ext4write with the data already in memory
+# Need to first put the data into RAM. Use base64 decode via "mw" commands
+
+# Better: push in small base64 chunks, decode each with 'setexpr' or 'echo'
+# Actually U-Boot has 'base64' command? No, not in 2018.07.
+# Use Python: just push the file via cat through stdin to U-Boot
+# But U-Boot doesn't have a cat-like command
+
+# Simpler: ext4write needs the data in RAM. We can write it using ymodem (loadb)
+# Or split into pieces and use 'mw' command
+
+# U-Boot has 'loady' (ymodem) and 'loadx' (xmodem)
+# We need to send the file via ymodem protocol over the same serial port
+# This is complex. Let me use a different approach:
+
+# SPLIT the boot.scr into pieces and use 'mw.l' to write them
+# Each word is 4 bytes. Each mw.l command can write multiple words.
+# file is 6470 bytes = 1618 words. We can do 64 words per command = 26 commands.
+log("Using mw.l to push data to RAM...")
+
+# Load 0x43200000 onwards
+addr = 0x43200000
+for i in range(0, size, 256):
+    chunk = boot_data[i:i+256]
+    if len(chunk) < 256:
+        chunk = chunk + b'\x00' * (256 - len(chunk))
+    # Convert to words (4 bytes each, little-endian)
+    words = []
+    for j in range(0, 256, 4):
+        w = int.from_bytes(chunk[j:j+4], 'little')
+        words.append(f"{w:08x}")
+    cmd = f"mw.l {addr + i:#x} " + " ".join(words[:32])
+    ser.write(cmd.encode() + b'\r')
+    time.sleep(0.1)
+    if i % 1024 == 0:
+        log(f"  Wrote {i}/{size} bytes...")
+    # Drain
+    if ser.in_waiting:
+        ser.read(ser.in_waiting)
+
+log("Data in RAM. Writing to /boot/boot.scr...")
+# ext4write: device part ram_addr filename offset size
+resp = send_cmd(ser, f"ext4write mmc 0:1 0x43200000 /boot/boot.scr 0x{0:08x} 0x{size:x}", 10)
+log(f"ext4write response: {resp}")
+
+# Verify
+log("Verifying...")
+resp = send_cmd(ser, "ext4size mmc 0:1 /boot/boot.scr", 5)
+log(f"ext4size: {resp}")
+
+logf.close(); ser.close()
+log(f"Log: {LOG}")

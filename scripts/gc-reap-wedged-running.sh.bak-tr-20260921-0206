@@ -1,0 +1,33 @@
+#!/bin/bash
+# gc-reap-wedged-running.sh — release per-agent dispatch slots stuck in 'running'.
+#
+# WHY (2026-09-19): a gc_execution_queue row that enters status='running' and never
+# reaches finishedAt holds that agent's slot, so every later mention of that agent
+# stays 'queued' with startedAt NULL forever. The web-ui then looks like the
+# automation "is not triggering". Observed: PA row started 2026-09-18 19:16:33 was
+# still 'running' 878 min later; PA's rows from 09:52/09:54 never dispatched, while
+# kernel-architect's nudge row went 'running' in 1s. Reaping the head row restores
+# dispatch for that agent.
+#
+# Rows are NOT deleted: they are marked failed with a reason so the audit trail and
+# the stale/nudge calculation stay honest.
+set -euo pipefail
+
+DB_GC="${DB_GC:-/home/host/.hermes-web-ui/hermes-web-ui.db}"
+ROOM="${ROOM_ID:-mti5ax1clq0zlx}"
+MAX_RUN_MIN="${MAX_RUN_MIN:-30}"   # a real turn never runs this long
+
+reaped=$(sqlite3 "$DB_GC" "SELECT COUNT(*) FROM gc_execution_queue
+  WHERE roomId='$ROOM' AND status='running'
+    AND startedAt IS NOT NULL
+    AND (strftime('%s','now')*1000 - startedAt)/60000.0 > $MAX_RUN_MIN;")
+
+sqlite3 "$DB_GC" "UPDATE gc_execution_queue
+  SET status='failed',
+      finishedAt=strftime('%s','now')*1000,
+      lastError='wedged_running_reaped (>${MAX_RUN_MIN}min, slot released)'
+  WHERE roomId='$ROOM' AND status='running'
+    AND startedAt IS NOT NULL
+    AND (strftime('%s','now')*1000 - startedAt)/60000.0 > $MAX_RUN_MIN;"
+
+echo "[$(date -Is)] gc-reap-wedged-running: reaped=$reaped room=$ROOM max_run_min=$MAX_RUN_MIN"

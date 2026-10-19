@@ -1,0 +1,4 @@
+* * * * * /usr/local/bin/trigger_agent_updates.sh
+* * * * * /usr/bin/python3 /home/host/opikernel/pvrgl-work/serial_single_owner.py --ensure >> /home/host/opikernel/pvrgl-work/serial_owner_cron.log 2>&1
+* * * * * cd /home/host/opikernel && flock -n /tmp/drift-killer.cron.lock python3 scripts/drift-killer.py >> /home/host/opikernel/logs/drift-killer-cron.log 2>&1
+* * * * * /home/host/opikernel/scripts/agent-drift-guard.sh >> /home/host/opikernel/logs/agent-drift-guard.cron.log 2>&1

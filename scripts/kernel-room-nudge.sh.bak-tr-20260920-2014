@@ -1,0 +1,101 @@
+#!/bin/bash
+# kernel-room-nudge.sh — continuous whip for the KernelDev-GPU room.
+#
+# WHY THIS EXISTS (2026-09-19):
+#   scripts/group-orchestrator.sh:100-101 gates its nudge call on
+#       if [ "$room" = "mti3yr2g3yjpyr" ]   # Neorunner ONLY
+#   so the kernel room (mti5ax1clq0zlx) got NO nudge on any tick.
+#
+# 2026-09-19 UPDATE (why the room still went quiet / "not triggering properly"):
+#   1. Cooldown was 900s with MAX_PER_TICK=3 -> one burst, then 15 min of silence
+#      while the queue kept piling up. Now: 240s cooldown, all stale agents per tick.
+#   2. Staleness came ONLY from gc_execution_queue rows, which never drain for
+#      agents whose worker session is not connected ("Agent X is not connected").
+#      Those rows made every agent look stale forever AND nudged agents who had
+#      just answered. Now the primary signal is the agent's LAST ROOM MESSAGE
+#      (same signal group_orchestrator_detect.py uses); the queue only fills in
+#      for agents that have never spoken.
+#
+# Cooldown state is shared with the Neorunner nudge: state/nudge-state.json,
+# keyed "<room>|<agent>". Per-agent mentions only — Nick's rule: no @all blasts.
+set -euo pipefail
+
+ROOM="${ROOM_ID:-mti5ax1clq0zlx}"
+DB_GC="${DB_GC:-/home/host/.hermes-web-ui/hermes-web-ui.db}"
+STATE_DIR="${STATE_DIR:-/home/host/opikernel/state}"
+STATE_FILE="$STATE_DIR/nudge-state.json"
+NUDGE_INTERVAL="${NUDGE_INTERVAL:-240}"   # >=4 min between nudges of the SAME agent
+IDLE_MIN="${IDLE_MIN:-6}"                 # silent longer than this == stale
+MAX_PER_TICK="${MAX_PER_TICK:-9}"         # one nudge per stale agent, never @all
+GHOSTS="${GHOSTS:-default,project analyzer}"  # non-agent rows in gc_room_agents
+
+mkdir -p "$STATE_DIR"
+[ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
+
+# Candidate selection: real room activity first, queue lag as fallback.
+STALE=$(GHOST_LIST="$GHOSTS" python3 - "$ROOM" "$IDLE_MIN" <<'PY'
+import sqlite3, sys, time, os
+room, idle_min = sys.argv[1], float(sys.argv[2])
+ghosts = {g.strip() for g in os.environ.get("GHOST_LIST", "").split(",") if g.strip()}
+now_ms = time.time() * 1000
+con = sqlite3.connect("/home/host/.hermes-web-ui/hermes-web-ui.db")
+con.row_factory = sqlite3.Row
+agents = con.execute("SELECT agentId, name FROM gc_room_agents WHERE roomId=?", (room,)).fetchall()
+out = []
+for a in agents:
+    if a["name"] in ghosts:
+        continue
+    m = con.execute("""SELECT timestamp FROM gc_messages
+                       WHERE roomId=? AND senderName=? ORDER BY timestamp DESC LIMIT 1""",
+                    (room, a["name"])).fetchone()
+    msg_age = (now_ms - m["timestamp"]) / 60000.0 if (m and m["timestamp"]) else None
+    q = con.execute("""SELECT createdAt, finishedAt, status FROM gc_execution_queue
+                       WHERE roomId=? AND targetAgentId=? AND status<>'pending'
+                       ORDER BY createdAt DESC LIMIT 1""", (room, a["agentId"])).fetchone()
+    q_ts = (q["finishedAt"] or q["createdAt"]) if q else None
+    q_age = (now_ms - q_ts) / 60000.0 if q_ts else 9999.0
+    age = msg_age if msg_age is not None else q_age
+    if age > idle_min:
+        stamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime((now_ms - age * 60000) / 1000))
+        out.append((age, a["name"], stamp))
+for age, name, stamp in sorted(out, key=lambda x: -x[0]):
+    print(f"{name}\t{stamp}\t{age:.1f}min silent")
+PY
+)
+
+[ -z "$STALE" ] && { echo "[$(date -Is)] kernel-nudge: no stale agents"; exit 0; }
+
+NOW=$(date +%s)
+LAST=$(cat "$STATE_FILE")
+NEW="$LAST"
+count=0
+
+while IFS=$'\t' read -r AGENT T AGE; do
+  [ -z "$AGENT" ] && continue
+  [ "$count" -ge "$MAX_PER_TICK" ] && break
+  KEY="$ROOM|$AGENT"
+  COOLDOWN_OK=$(python3 -c "
+import json
+try: d=json.loads('''$LAST''')
+except Exception: d={}
+print('1' if ($NOW - float(d.get('$KEY',0))) > $NUDGE_INTERVAL else '0')
+" 2>/dev/null || echo 1)
+  [ "$COOLDOWN_OK" = "0" ] && { echo "cooldown active: $AGENT"; continue; }
+
+  echo "[$(date -Is)] nudging $AGENT ($AGE)"
+  gc-post --room "$ROOM" --as TelegramRunner --mention "$AGENT" \
+    "@$AGENT — last room output was $T ($AGE). Do ONE bounded action for your role now (single command, real output) and post <=5 lines of hard evidence, or a one-line blocker. Do not wait on anyone." \
+    >/dev/null 2>&1 || echo "  gc-post FAILED for $AGENT"
+
+  NEW=$(python3 -c "
+import json
+try: d=json.loads('''$LAST''')
+except Exception: d={}
+d['$KEY']='$NOW'
+print(json.dumps(d))")
+  LAST="$NEW"
+  count=$((count+1))
+done <<< "$STALE"
+
+echo "$NEW" > "$STATE_FILE"
+echo "[$(date -Is)] kernel-nudge done (nudged=$count)"

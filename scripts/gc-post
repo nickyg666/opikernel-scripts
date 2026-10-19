@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# gc-post — post to the Hermes Web-UI group chat from ANY bash shell (no Hermes session).
+#
+#   gc-post "@all message text"
+#   gc-post --room mti5ax1clq0zlx --as "project analyzer" "text"
+#   echo "text" | gc-post -
+#   gc-post --list
+#   gc-post --history 20
+#
+# Env overrides: GC_ROOM_ID GC_BASE_URL GC_USER GC_PASS GC_NAME GC_PROFILE
+# Uses the hermes-agent venv python (has python-socketio + websocket-client).
+set -euo pipefail
+
+PY="${GC_PY:-/home/host/.hermes/hermes-agent/venv/bin/python3}"
+[ -x "$PY" ] || PY="$(command -v python3)"
+exec "$PY" /home/host/opikernel/scripts/gc-post.py "$@"

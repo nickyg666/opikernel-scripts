@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""webui-room-msg-guard — keep Hermes Web-UI group-chat rooms under the
+server's 'Group summary scan' limit, or EVERY mention in the room silently dies.
+
+Root cause (proven 2026-09-19, room mti5ax1clq0zlx):
+  hermes-web-ui/dist/server/index.js builds the summary scan as
+      SELECT ... WHERE roomId=? AND role IN ('user','assistant') AND TRIM(content)<>''
+        AND COALESCE(tool_name,'')='' AND COALESCE(tool_call_id,'')=''
+        AND COALESCE(tool_calls,'[]') IN ('','[]')
+        AND COALESCE(finish_reason,'') NOT IN ('tool_calls','streaming')
+        <not a "[Calling tool"/"[Tool result" line>
+      ORDER BY timestamp ASC, id ASC LIMIT 10001
+  and throws `Group summary scan exceeded 10000 eligible messages` when the
+  result set is 10001+.  processMentions runs that scan for EVERY incoming
+  message, so past 10k eligible messages the room accepts posts into history
+  but dispatches NOTHING: gc_execution_queue fills with status='queued' +
+  startedAt NULL forever and the room looks like the agents went on strike.
+
+What this guard does (idempotent, safe to run every 10 min):
+  1. Counts eligible messages per room with the server's own predicate.
+  2. If over MAX_ELIGIBLE, archives deleted rows to JSONL then deletes
+     noise first (orchestrator digests, nudge lines, billing/limit errors,
+     compression markers) and oldest-eligible-second until <= MAX_ELIGIBLE.
+  3. Fails undelivered queue rows (queued/pending with startedAt NULL) older
+     than QUEUE_MAX_AGE_MIN so a backlog cannot stampede once dispatch returns
+     (dumping them to CSV first).
+  4. Fails zombie 'running' rows: startedAt older than RUNNING_MAX_AGE_MIN AND
+     the target agent has posted in that row's room AFTER startedAt (proof the
+     turn progressed past its start and ended without closing the row). A turn
+     with no post since startedAt is left alone — it may genuinely still work.
+  5. Prints ONE summary line per room; prints nothing when nothing to do.
+
+Never deletes the newest MAX_ELIGIBLE messages and never touches rows that
+carry tool metadata (they are not counted by the server anyway).
+"""
+import json
+import os
+import sqlite3
+import sys
+import time
+
+DB = os.environ.get("WEBUI_DB", "/home/host/.hermes-web-ui/hermes-web-ui.db")
+ARCHIVE_DIR = os.environ.get("ROOM_GUARD_ARCHIVE", "/home/host/opikernel/state/room-guard")
+QUEUE_DUMP_DIR = "/home/host/opikernel/state/queue-purge"
+MAX_ELIGIBLE = int(os.environ.get("ROOM_GUARD_MAX", "9000"))
+QUEUE_MAX_AGE_MIN = int(os.environ.get("ROOM_GUARD_QUEUE_MIN", "30"))
+RUNNING_MAX_AGE_MIN = int(os.environ.get("ROOM_GUARD_RUNNING_MIN", "30"))
+
+ELIGIBLE = """roomId = ? AND role IN ('user','assistant') AND TRIM(content) <> ''
+ AND COALESCE(tool_name,'') = '' AND COALESCE(tool_call_id,'') = ''
+ AND COALESCE(tool_calls,'[]') IN ('','[]')
+ AND COALESCE(finish_reason,'') NOT IN ('tool_calls','streaming')"""
+
+NOISE_PREFIXES = (
+    "[orchestrator%",
+    "@all continue%",
+    "Billing or credits exhausted:%",
+    "API call failed after 3 retries:%",
+    "[COMPRESSED:%",
+    "%last room output was%",
+    "%idle >15m. Take ONE con%",
+)
+
+
+def archive(con, room, rows):
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+    path = os.path.join(ARCHIVE_DIR, f"{room}-{time.strftime('%Y%m%d-%H%M%S')}-{len(rows)}rows.jsonl")
+    with open(path, "w") as fh:
+        for r in rows:
+            fh.write(json.dumps(dict(r), default=str) + "\n")
+    return path
+
+
+def eligible_count(con, room):
+    return con.execute(f"SELECT count(*) FROM gc_messages WHERE {ELIGIBLE}", (room,)).fetchone()[0]
+
+
+def reap_undelivered(con):
+    cutoff = int((time.time() - QUEUE_MAX_AGE_MIN * 60) * 1000)
+    rows = [dict(r) for r in con.execute(
+        "SELECT * FROM gc_execution_queue WHERE status IN ('queued','pending')"
+        " AND startedAt IS NULL AND createdAt < ?", (cutoff,))]
+    if not rows:
+        return 0
+    os.makedirs(QUEUE_DUMP_DIR, exist_ok=True)
+    path = os.path.join(QUEUE_DUMP_DIR, f"undelivered-{time.strftime('%Y%m%d-%H%M%S')}.csv")
+    with open(path, "w", newline="") as fh:
+        import csv
+        w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    ids = [r["id"] for r in rows]
+    con.executemany(
+        "UPDATE gc_execution_queue SET status='failed',"
+        "lastError='undelivered_reaped_by_room_guard',"
+        "finishedAt=CAST(strftime('%s','now') AS INTEGER)*1000 WHERE id=?",
+        [(i,) for i in ids])
+    return len(ids)
+
+
+def reap_running(con):
+    """Fail zombie 'running' rows: old AND the agent posted after startedAt."""
+    cutoff = int((time.time() - RUNNING_MAX_AGE_MIN * 60) * 1000)
+    rows = [dict(r) for r in con.execute(
+        "SELECT * FROM gc_execution_queue WHERE status='running'"
+        " AND startedAt IS NOT NULL AND startedAt < ?"
+        " AND (finishedAt IS NULL OR finishedAt = 0)"
+        " AND EXISTS (SELECT 1 FROM gc_messages m"
+        "             WHERE m.roomId = gc_execution_queue.roomId"
+        "               AND m.senderName = gc_execution_queue.targetAgentName"
+        "               AND m.timestamp > gc_execution_queue.startedAt)",
+        (cutoff,))]
+    if not rows:
+        return 0
+    os.makedirs(QUEUE_DUMP_DIR, exist_ok=True)
+    path = os.path.join(QUEUE_DUMP_DIR, f"stale-running-{time.strftime('%Y%m%d-%H%M%S')}.csv")
+    with open(path, "w", newline="") as fh:
+        import csv
+        w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    con.executemany(
+        "UPDATE gc_execution_queue SET status='failed',"
+        "lastError='stale_running_reaped_by_room_guard',"
+        "finishedAt=CAST(strftime('%s','now') AS INTEGER)*1000 WHERE id=?",
+        [(r["id"],) for r in rows])
+    return len(rows)
+
+
+def guard_room(con, room):
+    before = eligible_count(con, room)
+    deleted_noise = 0
+    if before > MAX_ELIGIBLE:
+        for pat in NOISE_PREFIXES:
+            cur = con.execute(
+                f"DELETE FROM gc_messages WHERE {ELIGIBLE} AND content LIKE ?", (room, pat))
+            deleted_noise += cur.rowcount
+        con.commit()
+        # oldest-eligible trim, archived in chunks
+        while eligible_count(con, room) > MAX_ELIGIBLE:
+            batch = [dict(r) for r in con.execute(
+                f"SELECT * FROM gc_messages WHERE {ELIGIBLE} ORDER BY timestamp ASC, id ASC LIMIT 500",
+                (room,))]
+            if not batch:
+                break
+            archive(con, room, batch)
+            con.executemany("DELETE FROM gc_messages WHERE id = ?", [(b["id"],) for b in batch])
+            con.commit()
+    after = eligible_count(con, room)
+    return before, after, deleted_noise
+
+
+def main():
+    if not os.path.exists(DB):
+        print(f"room-guard: db missing {DB}", file=sys.stderr)
+        return 2
+    con = sqlite3.connect(DB, timeout=30)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout=20000")
+    except sqlite3.Error:
+        pass
+    rooms = [r[0] for r in con.execute("SELECT id FROM gc_rooms")]
+    lines = []
+    for room in rooms:
+        before, after, noise = guard_room(con, room)
+        if before != after:
+            lines.append(f"{room}: eligible {before}->{after} (noise {noise}); pruned to stay under {MAX_ELIGIBLE}")
+    reaped = reap_undelivered(con)
+    zombies = reap_running(con)
+    con.commit()
+    if reaped:
+        lines.append(f"reaped {reaped} undelivered queue rows (queued/pending, startedAt NULL, >{QUEUE_MAX_AGE_MIN}m old)")
+    if zombies:
+        lines.append(f"reaped {zombies} zombie 'running' queue rows (>{RUNNING_MAX_AGE_MIN}m old, agent posted after startedAt)")
+    for line in lines:
+        print("room-guard: " + line)
+    con.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

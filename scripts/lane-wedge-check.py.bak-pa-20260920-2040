@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Shared dead-lane predicate for group-chat rooms (public tool, 2026-09-20, PA).
+
+WHY THIS EXISTS
+    A lane goes dead when its (roomId, agentId) drain key is stuck: the web-ui
+    keeps _processingMentionQueues[room\\0agentId] latched, so every later
+    @mention for that key is pushed in-memory and never shifted -> the row stays
+    status='queued', startedAt NULL, lastError NULL, forever.  Agents that are
+    delivering fine in the SAME room keep completing normally, so the room looks
+    healthy while individual lanes are black holes.
+
+    Every whip/digest that @mentions such a lane makes it worse: measured 25
+    fresh undelivered rows in 30 min across build-engineer / powervr-monkey /
+    Backlog-worker2 / kernel-architect.  Quarantine the lane, escalate once.
+
+    This is the ONE predicate; group-orchestrator.sh and kernel-room-nudge.sh
+    both call it so the two whip paths can never disagree.
+
+USAGE
+    lane-wedge-check.py --room <roomId> --all            # name<TAB>why, one per line
+    lane-wedge-check.py --room <roomId> --names-only     # just the names
+    lane-wedge-check.py --room <roomId> --any A B C      # rc=0 if any of A/B/C wedged
+
+    rc: 0 = at least one wedged lane found, 1 = none, 2 = usage/DB error.
+
+TUNABLES (env)
+    WEDGE_WINDOW_MIN (180)  window the per-lane row stats are counted over
+    WEDGE_MIN_REAPS   (4)    >= this many reaped rows + 0 completions = wedged
+    WEDGE_MIN_QUEUED  (12)   or >= this many undrained rows + 0 completions = wedged
+                             (catches the case where the REAPER is stuck too, so
+                              rows sit at status='queued' and never even fail)
+    WEDGE_PILE        (40)   or >= this many still-queued rows = wedged
+    WEDGE_DB                 override the sqlite path
+"""
+import os
+import sqlite3
+import sys
+import time
+
+DB = os.environ.get("WEDGE_DB", "/home/host/.hermes-web-ui/hermes-web-ui.db")
+WINDOW_MIN = int(os.environ.get("WEDGE_WINDOW_MIN", "180"))
+MIN_REAPS = int(os.environ.get("WEDGE_MIN_REAPS", "4"))
+MIN_QUEUED = int(os.environ.get("WEDGE_MIN_QUEUED", "12"))
+PILE = int(os.environ.get("WEDGE_PILE", "40"))
+
+
+def wedged(room):
+    """[{name, why}] for every dead lane in `room`; [] when the drain is healthy."""
+    now_ms = time.time() * 1000
+    con = sqlite3.connect(DB)
+    out = []
+    for name, done, reaped, queued, total, first in con.execute(
+            """SELECT targetAgentName,
+                      sum(status='completed')        AS done,
+                      sum(lastError LIKE '%reaped%') AS reaped,
+                      sum(status='queued')           AS queued,
+                      count(*)                       AS total,
+                      min(createdAt)                 AS first_ms
+                 FROM gc_execution_queue
+                WHERE roomId=? AND createdAt>?
+             GROUP BY targetAgentName""",
+            (room, now_ms - WINDOW_MIN * 60000)):
+        if not name:
+            continue
+        if done == 0 and reaped >= MIN_REAPS:
+            out.append((name, "%d reaped / %d rows, 0 completed since %s" % (
+                reaped, total,
+                time.strftime('%H:%M', time.localtime(first / 1000)))))
+        elif done == 0 and queued >= MIN_QUEUED:
+            out.append((name, "%d mentions undrained, 0 completed since %s" % (
+                queued, time.strftime('%H:%M', time.localtime(first / 1000)))))
+        elif queued >= PILE:
+            out.append((name, "%d mentions undrained (queued, no completions)" % queued))
+    return out
+
+
+def main(argv):
+    room = None
+    mode = None
+    names = []
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--room":
+            i += 1
+            room = argv[i] if i < len(argv) else None
+        elif a == "--all":
+            mode = "all"
+        elif a == "--names-only":
+            mode = "names"
+        elif a == "--any":
+            mode, names = "any", argv[i + 1:]
+            break
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        else:
+            print("unknown arg: %s" % a, file=sys.stderr)
+            return 2
+        i += 1
+    if not room or not mode:
+        print(__doc__)
+        return 2
+    try:
+        bad = wedged(room)
+    except Exception as e:                      # DB busy/locked -> never wedge the caller
+        print("lane-wedge-check: db error: %s" % e, file=sys.stderr)
+        return 2
+    if mode == "all":
+        for n, why in bad:
+            print("%s\t%s" % (n, why))
+        return 0 if bad else 1
+    if mode == "names":
+        for n, _ in bad:
+            print(n)
+        return 0 if bad else 1
+    hit = [n for n, _ in bad if n in set(names)]
+    for n in hit:
+        print(n)
+    return 0 if hit else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,22 @@
+#!/bin/bash
+# serial_catch_uboot.sh — clean cycle + Enter-spam to catch U-Boot prompt.
+set -u
+DEV=/dev/ttyACM0
+LOG=/home/host/pvrgl-work/sercap_uboot.log
+
+pkill -f "cat /dev/ttyACM0" 2>/dev/null
+sleep 1
+sudo stty -F $DEV 115200 raw -echo
+(sudo setsid bash -c "exec cat $DEV >> $LOG" >/dev/null 2>&1 &)
+sleep 1
+python3 /home/host/smartplug.py reboot >/dev/null 2>&1
+echo "power cycled; spamming..."
+sleep 3
+for i in $(seq 1 44); do
+  printf "\n" | sudo tee $DEV >/dev/null 2>&1
+  sleep 0.25
+done
+echo "spam done; waiting 10s..."
+sleep 10
+wc -c $LOG
+grep -a "U-Boot\|=>" $LOG | tail -5

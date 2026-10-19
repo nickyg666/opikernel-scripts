@@ -1,0 +1,9 @@
+[Unit]
+Description=Crontab health guard (detects the empty-crontab wipe class)
+Documentation=file:///home/host/opikernel/logs/cron-health-guard.log
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /home/host/opikernel/scripts/cron-health-guard.sh
+# Runs from systemd, NOT cron: a cron-based guard dies in exactly the failure
+# it exists to detect (2026-09-30 17:34, 10 jobs silently lost for 13 min).

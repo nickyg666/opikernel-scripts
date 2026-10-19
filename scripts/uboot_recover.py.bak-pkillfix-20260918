@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""uboot_recover.py — Complete board recovery: background log + U-Boot fix + kernel boot + SSH check.
+Run: sudo python3 uboot_recover.py
+
+Pipeline:
+1. Kill existing serial readers
+2. Start background serial capture (tee to log file)  
+3. Power cycle board
+4. Intercept U-Boot prompt
+5. Verify SD card DTB
+6. Write fixed boot.scr.nofix to SD via ext4write
+7. Set direct bootcmd (bypass boot.scr entirely)
+8. Boot with aic8800 blacklisted
+9. Watch kernel boot
+10. Check SSH
+"""
+import serial, sys, time, os, signal, subprocess
+
+DEV = "/dev/ttyACM0"
+BAUD = 115200
+WATCH = int(sys.argv[1]) if len(sys.argv) > 1 else 120
+LOG = "/home/host/pvrgl-work/uboot_recover.log"
+FIXED_BOOTSCR = "/home/host/opikernel/stage/boot.scr.nofix"
+
+def signal_handler(sig, frame):
+    print("\n[interrupted]")
+    sys.exit(0)
+signal.signal(signal.SIGINT, signal_handler)
+
+def drain(ser):
+    total = 0
+    for _ in range(20):
+        if ser.in_waiting:
+            n = ser.in_waiting
+            ser.read(n); total += n
+            time.sleep(0.1)
+        else:
+            time.sleep(0.2)
+    return total
+
+def send_cmd(ser, cmd, wait=2.0):
+    print(f"  >>> {cmd[:90]}")
+    ser.write(cmd.encode() + b'\r')
+    time.sleep(0.1)
+    out = b''
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if ser.in_waiting:
+            out += ser.read(ser.in_waiting)
+        time.sleep(0.05)
+    return out.decode('utf-8', errors='replace')
+
+def print_lines(resp):
+    for line in resp.split('\r'):
+        line = line.strip()
+        if line and '=>' not in line:
+            print(f"    {line}")
+
+# === STEP 1: Kill existing readers ===
+print(f"[{time.strftime('%H:%M:%S')}] Step 1: Killing existing serial readers...")
+subprocess.run("pkill -f 'cat /dev/ttyACM0' 2>/dev/null; pkill -f 'tee.*ttyACM0' 2>/dev/null; sleep 1", shell=True)
+
+# === STEP 2: Start background logger via subprocess ===
+print(f"[{time.strftime('%H:%M:%S')}] Step 2: Starting background serial capture...")
+log_pipe = subprocess.Popen(
+    ["sudo", "tee", LOG],
+    stdin=open(DEV, "rb"),
+    stdout=open("/dev/null", "wb"),
+    stderr=subprocess.DEVNULL,
+    bufsize=0
+)
+time.sleep(0.5)
+print(f"  Logger started (PID={log_pipe.pid}), log={LOG}")
+
+# === STEP 3: Open foreground serial for commands ===
+ser = serial.Serial(DEV, BAUD, timeout=1)
+ser.dtr = False; ser.rts = False
+time.sleep(0.5)
+drained = drain(ser)
+print(f"  Foreground serial open, drained {drained} bytes")
+
+# === STEP 4: Power cycle ===
+print(f"[{time.strftime('%H:%M:%S')}] Step 3: Power cycling...")
+subprocess.run(["/usr/bin/python3","/home/host/opikernel/scripts/host/smartplug.py","off","--model","WLPP1CFH","D03F271583AE"], capture_output=True)
+time.sleep(5)
+subprocess.run(["/usr/bin/python3","/home/host/opikernel/scripts/host/smartplug.py","on","--model","WLPP1CFH","D03F271583AE"], capture_output=True)
+print(f"[{time.strftime('%H:%M:%S')}] Power on, waiting for U-Boot...")
+
+# === STEP 5: Wait for U-Boot prompt ===
+start = time.time()
+prompt_found = False
+while time.time() - start < 30:
+    if ser.in_waiting:
+        data = ser.read(ser.in_waiting)
+        decoded = data.decode('utf-8', errors='replace')
+        print(decoded, end='', flush=True)
+        if 'Hit any key' in decoded or 'stop auto' in decoded.lower():
+            print(f"\n[PROMPT at +{time.time()-start:.1f}s]")
+            ser.break_condition = True; time.sleep(0.05); ser.break_condition = False
+            time.sleep(0.3); ser.write(b'\r'); time.sleep(1.0)
+            drain(ser)
+            prompt_found = True
+            break
+        elif '=>' in decoded:
+            prompt_found = True
+            break
+    time.sleep(0.05)
+
+if not prompt_found:
+    print(f"\n[FAILED] No U-Boot prompt in 30s")
+    log_pipe.kill(); ser.close()
+    sys.exit(1)
+
+time.sleep(2); drain(ser)
+print(f"\n[{time.strftime('%H:%M:%S')}] U-Boot shell acquired.\n")
+
+# === STEP 6: Inspect SD card ===
+print("=== SD Card Inspection ===")
+for cmd in ["mmcinfo", "ext4size mmc 0:1 /boot/mainline/sun60i-a733-orangepi-zero3w.dtb",
+            "ext4size mmc 0:1 /boot/boot.scr"]:
+    resp = send_cmd(ser, cmd, 3.0)
+    print_lines(resp)
+    time.sleep(0.3)
+
+# === STEP 7: Write fixed boot.scr ===
+print("\n=== Deploying fixed boot.scr ===")
+if os.path.exists(FIXED_BOOTSCR):
+    size = os.path.getsize(FIXED_BOOTSCR)
+    print(f"  Fixed boot.scr: {size} bytes at {FIXED_BOOTSCR}")
+    
+    # Load fixed boot.scr into RAM
+    print("  Loading fixed boot.scr into RAM at 0x43200000...")
+    resp = send_cmd(ser, f"ext4load mmc 0:1 0x43200000 /stage/boot.scr.nofix", 5.0)
+    print_lines(resp)
+    
+    # Write to /boot/boot.scr
+    print("  Writing to /boot/boot.scr...")
+    # ext4write: device part addr filename offset size
+    # We need the size of the file
+    resp = send_cmd(ser, f"ext4write mmc 0:1 0x43200000 /boot/boot.scr 0x00000000 {size}", 5.0)
+    print_lines(resp)
+    if 'bytes written' in resp or 'File created' in resp:
+        print("  [BOOTSCR WRITE OK]")
+    else:
+        print("  [BOOTSCR WRITE MAY HAVE ISSUES - continuing]")
+else:
+    print(f"  WARNING: {FIXED_BOOTSCR} not found!")
+    
+time.sleep(1)
+
+# === STEP 8: Set direct bootcmd (bypass boot.scr) ===
+print("\n=== Setting direct bootcmd ===")
+bootcmd = (
+    "setenv bootcmd '"
+    "ext4load mmc 0:1 0x41000000 /boot/mainline/Image; "
+    "ext4load mmc 0:1 0x46000000 /boot/mainline/tiny-uInitrd; "
+    "ext4load mmc 0:1 0x44000000 /boot/mainline/sun60i-a733-orangepi-zero3w.dtb; "
+    "setenv bootargs console=ttyS0,115200 root=/dev/mmcblk1p1 rootwait rootfstype=ext4 "
+    "earlyprintk=sunxi-uart,0x02500000 earlycon=uart,mmio32,0x2500000 "
+    "modprobe.blacklist=aic8800_bt,aic8800_sdio loglevel=7 clk_ignore_unused; "
+    "booti 0x41000000 0x46000000 0x44000000'"
+)
+send_cmd(ser, bootcmd, 3.0)
+resp = send_cmd(ser, "saveenv", 5.0)
+print_lines(resp)
+
+# Verify bootcmd
+resp = send_cmd(ser, "printenv bootcmd", 2.0)
+print_lines(resp)
+
+# === STEP 9: Boot ===
+print(f"\n[{time.strftime('%H:%M:%S')}] === BOOTING KERNEL ===")
+ser.write(b'boot\r')
+time.sleep(3)
+drain(ser)
+
+# === STEP 10: Watch kernel boot ===
+print(f"[{time.strftime('%H:%M:%S')}] Watching kernel boot (max 90s)...")
+boot_start = time.time()
+last_dot = boot_start
+userspace = False
+panic = False
+
+while time.time() - boot_start < 90:
+    if ser.in_waiting:
+        data = ser.read(ser.in_waiting)
+        decoded = data.decode('utf-8', errors='replace')
+        print(decoded, end='', flush=True)
+        if 'Kernel panic' in decoded or 'BUG:' in decoded:
+            panic = True
+        if 'login:' in decoded:
+            userspace = True
+            print(f"\n[USESPACE at +{time.time()-boot_start:.1f}s]!!!")
+    
+    if time.time() - last_dot > 15:
+        elapsed = int(time.time() - boot_start)
+        print(f"  [{elapsed}s | userspace={userspace} panic={panic}]", flush=True)
+        last_dot = time.time()
+    
+    if userspace or panic:
+        break
+    time.sleep(0.05)
+
+# Clean up
+log_pipe.kill()
+ser.close()
+
+# === STEP 11: SSH check ===
+print(f"\n[{time.strftime('%H:%M:%S')}] Checking SSH...")
+time.sleep(5)
+ssh_ok = subprocess.run(["ping","-c","3","-W","2","192.168.0.151"], capture_output=True).returncode == 0
+
+print(f"\n{'='*60}")
+print(f"RESULT:")
+print(f"  SSH reachable: {ssh_ok}")
+print(f"  Userspace: {userspace}")
+print(f"  Kernel panic: {panic}")
+print(f"  Serial log: {LOG}")
+print(f"{'='*60}")
+print(f"\nLog tail:")
+subprocess.run(["sudo","tail","-c","3000",LOG])

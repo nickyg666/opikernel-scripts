@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""boot_from_scr.py — Just run the existing boot.scr (no overrides) to see if it boots.
+This is the "stock" working approach.
+Usage: sudo python3 boot_from_scr.py
+"""
+import serial, sys, time, os, subprocess
+
+DEV = "/dev/ttyACM0"
+BAUD = 115200
+LOG = "/home/host/pvrgl-work/boot_from_scr.log"
+
+logf = open(LOG, 'w', buffering=1)
+def log(msg):
+    ts = time.strftime('%H:%M:%S')
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    logf.write(line + "\n"); logf.flush()
+
+def drain(ser):
+    for _ in range(20):
+        if ser.in_waiting:
+            ser.read(ser.in_waiting)
+        time.sleep(0.1)
+
+def wait_for(ser, patterns, timeout=30):
+    start = time.time()
+    buf = b''
+    while time.time() - start < timeout:
+        if ser.in_waiting:
+            data = ser.read(ser.in_waiting)
+            buf += data
+            decoded = buf.decode('utf-8', errors='replace')
+            for p in patterns:
+                if p in decoded:
+                    return p, decoded
+        time.sleep(0.05)
+    return None, buf.decode('utf-8', errors='replace')
+
+log("Killing readers...")
+subprocess.run("sudo /home/host/opikernel/scripts/claim-serial-port.sh >/dev/null 2>&1", shell=True)
+time.sleep(2)
+
+log("Opening serial...")
+ser = serial.Serial(DEV, BAUD, timeout=1)
+ser.dtr = False; ser.rts = False
+time.sleep(0.5)
+drain(ser)
+
+log("Power cycle...")
+subprocess.run(["/usr/bin/python3","/home/host/opikernel/scripts/host/smartplug.py","off","--model","WLPP1CFH","D03F271583AE"], capture_output=True)
+time.sleep(5)
+subprocess.run(["/usr/bin/python3","/home/host/opikernel/scripts/host/smartplug.py","on","--model","WLPP1CFH","D03F271583AE"], capture_output=True)
+
+# Just let it auto-boot from boot.scr (no break)
+log("Letting it auto-boot from boot.scr (60s)...")
+start = time.time()
+userspace = False
+panic = False
+buf = b''
+while time.time() - start < 60:
+    if ser.in_waiting:
+        data = ser.read(ser.in_waiting)
+        buf += data
+        decoded = data.decode('utf-8', errors='replace')
+        logf.write(decoded); logf.flush()
+        if 'login:' in decoded:
+            userspace = True; log("*** USERSAPCE ***"); break
+        if 'Kernel panic' in decoded:
+            panic = True; log("*** PANIC ***"); break
+    time.sleep(0.05)
+
+logf.close(); ser.close()
+time.sleep(5)
+ssh_ok = subprocess.run(["ping","-c","3","-W","2","192.168.0.151"], capture_output=True).returncode == 0
+log(f"\nRESULT: SSH={ssh_ok} userspace={userspace} panic={panic}")
+log(f"Log: {LOG} ({os.path.getsize(LOG)} bytes)")

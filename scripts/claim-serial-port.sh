@@ -1,0 +1,50 @@
+#!/bin/bash
+# Canonical /dev/opiz3w-serial claim. Use this INSTEAD of any `pkill -f 'cat /dev/opiz3w-serial'`.
+#
+# WHY: `pkill -f '<pattern>'` matches the whole command line — including the
+# `bash -c "... pkill -f 'cat /dev/opiz3w-serial' ..."` wrapper that Hermes/agents use to
+# run the command. So the shotgun reap kills the calling shell itself (and any
+# sibling agent whose cmdline contains the same literal). Symptom: "the agent died
+# mid-run", "the capture stopped for no reason", "the board looks hung".
+#
+# This claims the port safely:
+#   1. PID-aware reap of real `cat` readers (never matches a shell).
+#   2. `fuser -k` on the device node for anything else still holding it.
+#   3. Verify, and report every remaining holder's pid/comm so the caller knows
+#      whether someone legitimate (e.g. the serial lease owner) still owns it.
+#
+# Exit 0 = port claimed (no holders). Exit 1 = still held by a foreign process.
+set -u
+# Stable-name aware: the pico re-enumerates as ttyACM1+ after a wedge recovery.
+if [ -z "${SERIAL_PORT:-}" ] && [ -e /dev/opiz3w-serial ]; then
+    PORT=/dev/opiz3w-serial
+else
+    PORT="${SERIAL_PORT:-/dev/opiz3w-serial}"
+fi
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+if [ -x "$HERE/kill-serial-runaways.py" ]; then
+    sudo -n python3 "$HERE/kill-serial-runaways.py" 2>/dev/null | head -1 || true
+elif [ -x /home/host/opikernel/scripts/kill-serial-runaways.py ]; then
+    sudo -n python3 /home/host/opikernel/scripts/kill-serial-runaways.py 2>/dev/null | head -1 || true
+fi
+
+# Anything else holding the port (stale python serial.Serial from a dead run).
+# NOT done by default: the serial lease has a single legitimate owner (the capture
+# process), and blind-killing it is how captures keep vanishing. Pass --force when
+# you genuinely need the port back, or kill the pid named below by hand.
+FORCE=0
+[ "${1:-}" = "--force" ] && FORCE=1
+if [ "$FORCE" = "1" ]; then
+    sudo -n fuser -k "$PORT" 2>/dev/null || true
+    sleep 1
+fi
+
+holders=$(lsof -t "$PORT" 2>/dev/null | wc -l)
+if [ "$holders" -gt 0 ]; then
+    echo "CLAIM-FAIL: $holders holder(s) still on $PORT:"
+    lsof "$PORT" 2>/dev/null | tail -n +2 | awk '{print "  pid", $2, $1}'
+    exit 1
+fi
+echo "CLAIM-OK: $PORT is free"
+exit 0

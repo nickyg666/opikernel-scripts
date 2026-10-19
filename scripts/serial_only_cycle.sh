@@ -1,0 +1,18 @@
+#!/bin/bash
+# serial_only_cycle.sh — ONE clean capture, power cycle, serial-only watch.
+set -u
+DEV=/dev/opiz3w-serial
+LOG=/home/host/pvrgl-work/sercap_one.log
+
+sudo /home/host/opikernel/scripts/claim-serial-port.sh >/dev/null 2>&1
+sleep 1
+sudo stty -F $DEV 115200 raw -echo
+(sudo setsid bash -c "exec cat $DEV >> $LOG" >/dev/null 2>&1 &)
+sleep 1
+python3 /home/host/smartplug.py off >/dev/null 2>&1
+sleep 8
+python3 /home/host/smartplug.py on >/dev/null 2>&1
+echo "cycled; waiting 90s..."
+sleep 90
+echo "=== last 30 lines ==="
+tail -c 4000 $LOG | grep -a . | tail -30

@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""uboot_coldboot.py — Clear buffer, power cycle, intercept U-Boot prompt.
+Usage: sudo python3 uboot_coldboot.py [watch_seconds=90]
+"""
+import serial, sys, time, os, signal, subprocess
+
+DEV = "/dev/ttyACM0"
+BAUD = 115200
+WATCH = int(sys.argv[1]) if len(sys.argv) > 1 else 90
+LOG = "/home/host/pvrgl-work/uboot_coldboot.log"
+
+def signal_handler(sig, frame):
+    print(f"\n[interrupted]")
+    sys.exit(0)
+signal.signal(signal.SIGINT, signal_handler)
+
+# Step 1: Ensure no other serial readers
+subprocess.run("pkill -f 'cat /dev/ttyACM0' 2>/dev/null; pkill -f 'uboot_coldboot' 2>/dev/null; sleep 1", shell=True)
+
+# Step 2: Open serial port, drain ALL pending data
+print(f"[{time.strftime('%H:%M:%S')}] Opening {DEV}...")
+ser = serial.Serial(DEV, BAUD, timeout=1)
+ser.dtr = False
+ser.rts = False
+time.sleep(0.5)
+
+drained = ser.in_waiting
+if drained:
+    ser.read(drained)
+    print(f"  drained {drained} stale bytes")
+time.sleep(0.5)
+
+# Verify clean buffer
+if ser.in_waiting:
+    more = ser.read(ser.in_waiting)
+    print(f"  extra drain: {len(more)} bytes")
+time.sleep(0.5)
+
+# Step 3: Open log file
+log_fd = open(LOG, "wb")
+print(f"[{time.strftime('%H:%M:%S')}] Log: {LOG}")
+
+# Step 4: Power cycle via smartplug
+print(f"[{time.strftime('%H:%M:%S')}] Powering off opiz3w...")
+subprocess.run([
+    "/usr/bin/python3", "/home/host/opikernel/scripts/host/smartplug.py",
+    "off", "--model", "WLPP1CFH", "D03F271583AE"
+], capture_output=True)
+time.sleep(5)  # Let capacitor discharge
+
+print(f"[{time.strftime('%H:%M:%S')}] Powering on opiz3w...")
+subprocess.run([
+    "/usr/bin/python3", "/home/host/opikernel/scripts/host/smartplug.py",
+    "on", "--model", "WLPP1CFH", "D03F271583AE"
+], capture_output=True)
+
+# Step 5: Watch for U-Boot bootloop and "Hit any key"
+print(f"[{time.strftime('%H:%M:%S')}] Watching for U-Boot prompt (max {WATCH}s)...")
+start = time.time()
+last_dot = start
+boot0_seen = False
+uboot_seen = False
+prompt_sent = False
+got_shell = False
+in_bootloop = 0
+prev_pos = 0
+
+while time.time() - start < WATCH:
+    if ser.in_waiting:
+        data = ser.read(ser.in_waiting)
+        log_fd.write(data)
+        log_fd.flush()
+        decoded = data.decode('utf-8', errors='replace')
+        
+        # Count boot cycles
+        boot0_count = decoded.count("HELLO! BOOT0 is starting")
+        if boot0_count > 0 and not boot0_seen:
+            boot0_seen = True
+            elapsed = time.time() - start
+            print(f"\n[BOOT0 at +{elapsed:.1f}s]")
+        
+        # Detect "Hit any key" 
+        if 'Hit any key' in decoded or 'stop auto' in decoded.lower():
+            if not prompt_sent:
+                elapsed = time.time() - start
+                print(f"\n[PROMPT at +{elapsed:.1f}s] Sending break + newline...")
+                # Send break
+                ser.break_condition = True
+                time.sleep(0.05)
+                ser.break_condition = False
+                time.sleep(0.2)
+                # Send enter
+                ser.write(b'\r')
+                time.sleep(0.5)
+                # Drain response
+                if ser.in_waiting:
+                    resp = ser.read(ser.in_waiting)
+                    log_fd.write(resp)
+                    log_fd.flush()
+                    decoded2 = resp.decode('utf-8', errors='replace')
+                    print(decoded2, end='', flush=True)
+                    if '=>' in decoded2 or '#' in decoded2:
+                        got_shell = True
+                        print("[SHELL ACQUIRED]")
+                prompt_sent = True
+        
+        # Detect U-Boot prompt even without break
+        if ('=>' in decoded or '#' in decoded) and not got_shell:
+            got_shell = True
+            print(f"\n[SHELL via prompt at +{time.time()-start:.1f}s]")
+        
+        # Dot status
+        if time.time() - last_dot > 5:
+            elapsed = int(time.time() - start)
+            pos = log_fd.tell()
+            new_bytes = pos - prev_pos
+            prev_pos = pos
+            print(f"  [{elapsed}s | +{new_bytes}B | boot0={boot0_seen}]", flush=True)
+            last_dot = time.time()
+    
+    time.sleep(0.05)
+
+log_fd.close()
+ser.close()
+
+# Final report
+with open(LOG, "rb") as f:
+    content = f.read().decode('utf-8', errors='replace')
+
+boot0_times = [int(x.split('[')[1].split(']')[0]) for x in content.split('\n') if 'BOOT0 is starting' in x]
+print(f"\n=== RESULT ===")
+print(f"  Log: {LOG} ({os.path.getsize(LOG)} bytes)")
+print(f"  Boot0 count: {len(boot0_times)}")
+if boot0_times:
+    print(f"  BOOT0 times: {boot0_times} ms")
+print(f"  Shell acquired: {got_shell}")
+if got_shell:
+    print(f"\n  U-Boot shell READY — now use uboot_exec.py to fix filesystem")
