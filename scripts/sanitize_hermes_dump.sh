@@ -61,7 +61,7 @@ s = re.sub(r'github_pat_[A-Za-z0-9_]{20,}', 'github_pat_REDACTED', s)
 s = re.sub(r'(?i)\b(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b', 'REDACTED_JWT', s)
 s = re.sub(r'(?i)\b(token|api[_-]?key|secret|password)\s*[=:]\s*["\']?[A-Za-z0-9_\-\.]{16,}["\']?', r'\1: REDACTED', s)
 # known NAS/DAS passwords
-s = s.replace('REDACTED_NAS_PW', 'NAS_PW_REDACTED')
+s = s.replace(NAAS_PW_LITERAL, 'NAS_PW_REDACTED')
 if s != orig:
     open(p, 'w', encoding='utf-8').write(s)
 EOF
@@ -75,7 +75,7 @@ p = sys.argv[1]
 s = open(p, encoding='utf-8', errors='replace').read()
 s = re.sub(r'ghp_[A-Za-z0-9]{20,}', 'ghp_REDACTED', s)
 s = re.sub(r'\b(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b', 'REDACTED_JWT', s)
-s = s.replace('REDACTED_NAS_PW', 'NAS_PW_REDACTED')
+s = s.replace(NAAS_PW_LITERAL, 'NAS_PW_REDACTED')
 open(p, 'w', encoding='utf-8').write(s)
 EOF
 
@@ -97,7 +97,7 @@ EOF
 
 # ---- leftover secret scan (should print nothing) ----
 echo "=== leftover scan ==="
-grep -rlEi 'ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|REDACTED_NAS_PW|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}' "$DST" 2>/dev/null | head -10 || true
+grep -rlEi 'ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|NAAS_PW_LITERAL|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}' "$DST" 2>/dev/null | head -10 || true
 echo "=== dump size ==="
 du -sh "$DST"
 echo "=== tree ==="

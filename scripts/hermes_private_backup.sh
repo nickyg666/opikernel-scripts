@@ -8,8 +8,8 @@ DUMP_DIR=/home/host/hermes-private-dump
 SANITIZE=/home/host/opikernel/scripts/sanitize_hermes_dump.sh
 NAS_TARGET="nas@192.168.0.11:/mnt/4tb_bad200/hermes-private-backups/"
 DAS_TARGET="das@192.168.0.9:/mnt/free3t/hermes-private-backups/"
-NAS_PW='REDACTED_NAS_PW'
-DAS_PW='1'
+# Credentials live OUTSIDE this repo: /home/host/.secrets/nas.env (0600).
+[ -r /home/host/.secrets/nas.env ] && . /home/host/.secrets/nas.env
 TS=$(date +%Y%m%d-%H%M%S)
 TARBALL="$BACKUP_DIR/hermes-private-$TS.tar.gz"
 
